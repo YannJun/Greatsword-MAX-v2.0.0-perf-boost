@@ -348,6 +348,11 @@ end
 --     When it cannot be asked the caller supplies the 'unknown' answer, which is the one
 --     that leaves the game's own bindings alone.
 function sm32.pad_connected(unknown)
+	local now = os.clock()
+	if sm32.pad_connected_val ~= nil and sm32.pad_connected_at and (now - sm32.pad_connected_at) < 1.0 then
+		return sm32.pad_connected_val
+	end
+	sm32.pad_connected_at = now
 	local s, td = sm32.pad_engine()
 	if s ~= nil and td ~= nil then
 		if sm32.pad_count_method == nil then
@@ -356,10 +361,14 @@ function sm32.pad_connected(unknown)
 	end
 	if s ~= nil and td ~= nil and sm32.pad_count_method ~= false and sm32.pad_count_method ~= nil then
 		local ok, count = pcall(sdk.call_native_func, s, td, "getConnectingDevicesCount")
-		if ok and type(count) == "number" then return count > 0 end
+		if ok and type(count) == "number" then
+			sm32.pad_connected_val = count > 0
+			return sm32.pad_connected_val
+		end
 	end
 	sm32.note("GamePad.getConnectingDevicesCount")
-	return unknown or false
+	sm32.pad_connected_val = unknown or false
+	return sm32.pad_connected_val
 end
 
 --(6) Nil-checked managed method lookup
@@ -694,18 +703,37 @@ end
 --the shipped action list.  via.behaviortree.BehaviorTree.hasNode(name, treeIndex) answers per tree,
 --and every motion layer is one tree, so this gives the real layer even when the node object cannot
 --be reached.  Returns nil when the character has no such node on any layer.
+sm32.node_layer_cache = sm32.node_layer_cache or setmetatable({}, { __mode = "k" })
+
 function sm32.node_layer(fsm, name)
 	if fsm == nil or type(name) ~= "string" or name == "" then return nil end
 	local short = name:match(".+%.(.+)") or name
+	local by_fsm = sm32.node_layer_cache[fsm]
+	if by_fsm then
+		local cached = by_fsm[short]
+		if cached ~= nil then
+			return cached ~= false and cached or nil
+		end
+	else
+		by_fsm = {}
+		sm32.node_layer_cache[fsm] = by_fsm
+	end
 	local ok_count, count = pcall(function() return fsm:call("getTreeCount()") end)
 	count = (ok_count and type(count) == "number" and count > 0) and count or 2
 	for layer = 0, math.min(count, 8) - 1 do
 		local ok, has = pcall(function() return fsm:call("hasNode(System.String, System.UInt32)", short, layer) end)
-		if ok and has == true then return layer end
+		if ok and has == true then
+			by_fsm[short] = layer
+			return layer
+		end
 	end
 	local ok1, has1 = pcall(function() return fsm:call("hasNode(System.String)", short) end)
-	if ok1 and has1 == true then return 0 end
+	if ok1 and has1 == true then
+		by_fsm[short] = 0
+		return 0
+	end
 	if not ok1 then sm32.note("BehaviorTree.hasNode") end
+	by_fsm[short] = false
 	return nil
 end
 
@@ -2988,11 +3016,9 @@ local function change_material_float4(main_mesh, color, param_name, do_children,
 	recurse(main_mesh)
 end
 
-local function change_efx2_color(efx2, nstore, color_tbl)
+local function change_efx2_color(efx2, nstore, color_tbl, shell_inst)
 	local shell = nstore.shell
 	color_tbl = color_tbl or shell.coloring
-	local coloring = sm32.valuetype("via.Color")
-	sm32.color_vec4(coloring, Vector4f.new(color_tbl[1], color_tbl[2], color_tbl[3], color_tbl[4]))
 	--"is this colour plain white, so leave the effect alone" was asked by comparing the four channels
 	--joined into a string against "1.01.01.01.0".  That only holds while they are floats: the node
 	--template stores them as the integers {1,1,1,1}, which joins to "1111", and a settings file that
@@ -3002,6 +3028,14 @@ local function change_efx2_color(efx2, nstore, color_tbl)
 	for i = 1, 4 do
 		if (tonumber(color_tbl[i]) or 1) ~= 1 then is_white = false; break end
 	end
+	if shell.do_vfx and is_white then return end
+	local coloring
+	if shell.do_vfx and not is_white then
+		coloring = sm32.valuetype("via.Color")
+		if coloring then
+			sm32.color_vec4(coloring, Vector4f.new(color_tbl[1], color_tbl[2], color_tbl[3], color_tbl[4]))
+		end
+	end
 	local do_color = shell.do_vfx and coloring ~= nil and not is_white
 	local c_effects, seen_effects, seen_any = {}, {}, false
 	--local radial_blurs = {}
@@ -3009,27 +3043,31 @@ local function change_efx2_color(efx2, nstore, color_tbl)
 	local walk_tick = -1
 
 	temp_fns[efx2] = function(force)
+		if not efx2:get_Valid() or (shell_inst and not shell_inst:get_Valid()) then
+			temp_fns[efx2] = nil
+			return
+		end
 		--The effects this manager will create do not exist yet on the frame the shell is instantiated,
 		--and this closure used to retire itself on its very first pass, when none of them existed.  Both
 		--of its jobs - culling the effects when the visuals are switched off, and tinting them when a
 		--colour is set - therefore did nothing at all.  Give it a window to wait for them, and close
-		--that window as soon as one effect has been seen, so it still retires once its work is done.
-		local no_effect_timeout = (not seen_any) and not force and (game_time - start) >= 10.0
-		if no_effect_timeout or (game_time - start > sms.shell_lifetime_limit) then
+		--that window once the shell's effects have finished or been culled.
+		local elapsed = game_time - start
+		local no_effect_timeout = (not seen_any) and not force and elapsed >= 1.5
+		local done_after_seen = seen_any and not force and not next(c_effects) and elapsed >= 0.5
+		if no_effect_timeout or done_after_seen or (elapsed > sms.shell_lifetime_limit) then
 			temp_fns[efx2] = nil
 			if sm32.dbg_on and do_color and not seen_any then
 				sm32.dbg("vfx", "the colour pass gave up without the engine ever creating an effect for this shell")
 			end
-			--for radial, filter in pairs(radial_blurs) do
-			--	filter:set_Enabled(true)
-			--end
+			return
 		--Looking for effects the manager has created since the last pass means walking its whole
 		--effect list, and turning each entry's own list into a Lua table to walk that.  That is by far
 		--the most expensive thing this closure does, it runs for every coloured or hidden shell, and
 		--until now it ran on every frame of the shell's life.  An effect that is tinted three frames
 		--after it appears is not something anyone can see, so the walk is made a few frames apart -
 		--except on the creation frame, which is always walked.
-		elseif efx2.CreatedEffectDataList then
+		elseif (force or ticks - walk_tick >= 3) and efx2.CreatedEffectDataList then
 			walk_tick = ticks
 			for i, c_effect_data in pairs(efx2.CreatedEffectDataList._items) do
 				if not c_effect_data then break end
@@ -3042,15 +3080,15 @@ local function change_efx2_color(efx2, nstore, color_tbl)
 					seen_any = true
 					if not c_effect.IsFinished and not seen_effects[c_effect] then --only change new ones
 						seen_effects[c_effect] = true
-						local try, dict = pcall(func.lua_get_dict, c_effect.CreatedEffects)
-						for std_data_elem, effect_player_list in pairs(try and dict or {}) do
-							--if do_color then std_data_elem.Color = coloring end
-							if effect_player_list._items.__pairs then --weird bug
-								for e, effect_player in pairs(effect_player_list._items) do
-									if not effect_player then break end
-									c_effects[c_effect] = c_effects[c_effect] or {}
-									table.insert(c_effects[c_effect], effect_player)
-									if do_color then
+						if do_color then
+							local try, dict = pcall(func.lua_get_dict, c_effect.CreatedEffects)
+							for std_data_elem, effect_player_list in pairs(try and dict or {}) do
+								--if do_color then std_data_elem.Color = coloring end
+								if effect_player_list._items.__pairs then --weird bug
+									for e, effect_player in pairs(effect_player_list._items) do
+										if not effect_player then break end
+										c_effects[c_effect] = c_effects[c_effect] or {}
+										table.insert(c_effects[c_effect], effect_player)
 										local ok_sc, err_sc = pcall(function() effect_player:set_Color(coloring) end)
 										if not ok_sc then
 											sm32.note("via.effect.EffectPlayer.set_Color")
@@ -3063,8 +3101,6 @@ local function change_efx2_color(efx2, nstore, color_tbl)
 									end
 								end
 							end
-						end
-						if do_color then
 							local ok_rc, err_rc = pcall(function() c_effect:setRootColor(coloring) end)
 							if not ok_rc then
 								sm32.note("CreatedEffectContainer.setRootColor")
@@ -3531,7 +3567,13 @@ local function get_req_tracks(chara) --jfc
 	local seq = chara:get_SequenceController()
 	local tlist = seq and seq.TracksList
 	local tracks = tlist and tlist[0] and tlist[0].Tracks
-	return tracks and tracks:ContainsKey(sdk.typeof("app.ColliderReqTracks")) and tracks[sdk.typeof("app.ColliderReqTracks")]
+	if not tracks then return nil end
+	local req_type = sm32.collider_req_tracks_type
+	if not req_type then
+		req_type = sdk.typeof("app.ColliderReqTracks")
+		sm32.collider_req_tracks_type = req_type
+	end
+	return tracks:ContainsKey(req_type) and tracks[req_type]
 end
 
 local function disp_smnode_imgui(shell, shell_idx, skill_tbl, imgui_data, smnodes, running_skill_tbl, enemy_name, enemy_chr)
@@ -5570,7 +5612,7 @@ local function display_mod_imgui(is_window)
 			
 			if clicked_load and sms.skillsets.idxes[i] > 1 then
 				load_skillset(skillsets_glob[sms.skillsets.idxes[i] ], i)
-			gsmax_runtime_cache_sig = nil
+				sm32.gsmax_runtime_cache_sig = nil
 				skillset_txt = skillsets_glob.short[sms.skillsets.idxes[i] ]
 				was_changed = true
 			end
@@ -6854,9 +6896,11 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 	end
 	
 	temp_fns[i] = function()
-		if (game_time - storage.start > skill_tbl.duration + 0.25) or (skill_tbl.do_hold_button and not hk.check_hotkey("Use Skill "..i, true)) then --slight delay
+		if not casted_spells[i] or casted_spells[i].storage ~= storage or (game_time - storage.start > skill_tbl.duration + 0.25) or (skill_tbl.do_hold_button and not hk.check_hotkey("Use Skill "..i, true)) then --slight delay
 			temp_fns[i] = nil
-			casted_spells[i] = nil
+			if casted_spells[i] and casted_spells[i].storage == storage then
+				casted_spells[i] = nil
+			end
 			is_casting = not not next(casted_spells)
 		end
 	end
@@ -7179,13 +7223,20 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 					local node, actions
 					local has_action = smnode.action_idx > 1 and type(smnode.action_name) == "string" and smnode.action_name ~= ""
 					if smnode.action_idx > 1 then
-						local ok_tree, tree = pcall(function() return own_mfsm2:getLayer(0):get_tree_object() end)
+						local tree_dead = (sm32.tree_byname == false and sm32.tree_walk == false)
+						local ok_tree, tree
+						if not tree_dead then
+							ok_tree, tree = pcall(function() return own_mfsm2:getLayer(0):get_tree_object() end)
+						end
 						tree = ok_tree and tree or nil
 						node = sm32.tree_node(tree, smnode.action_name)
 						if tree then sm32.tree_probe(tree, own_mfsm2) end
 
 						if not node then
-							local ok_tree2, tree2 = pcall(function() return own_mfsm2:getLayerCount() > 1 and own_mfsm2:getLayer(1):get_tree_object() or nil end)
+							local ok_tree2, tree2
+							if not tree_dead then
+								ok_tree2, tree2 = pcall(function() return own_mfsm2:getLayerCount() > 1 and own_mfsm2:getLayer(1):get_tree_object() or nil end)
+							end
 							tree = (ok_tree2 and tree2) or nil --UpperBody
 							node = sm32.tree_node(tree, smnode.action_name)
 
@@ -7409,6 +7460,7 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 					--setup custom_fn vars
 					local fn_env, lua_fn
 					local cust_fn_text = smnode.custom_fn
+					local uses_last_hitbox = false
 					local imgui_shell = imgui_shell_list and imgui_shell_list[func.find_key(skill_tbl.smnodes, smnode)] or {enabled=true, opened=false, last_data={}}
 					
 					if cust_fn_text ~= "" then 
@@ -7466,28 +7518,58 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 							end,
 							Kill = function(skill_name) 
 								if skill_name then
-									if active_skills[skill_name] then casted_spells[active_skills[skill_name].storage.key] = nil end
+									local target = active_skills[skill_name]
+									if target and target.storage then
+										local tkey = target.storage.key
+										casted_spells[tkey] = nil
+										if target.storage == storage then
+											stopped_fn = true
+											temp_fns[i] = nil
+										end
+									end
 								else
-									casted_spells[i] = nil 
+									casted_spells[i] = nil
+									stopped_fn = true
+									temp_fns[i] = nil
 								end
 							end,
 						}
-						cust_fn_text = cust_fn_text:gsub("RunLuaFile%(['\"].-['\"]%)", function(found_call)
-							local path = found_call:match("RunLuaFile%(['\"](.-)['\"]%)")
-							local file = io.input("SkillMaker\\CustomFn\\"..path:lower():gsub("%.lua", "")..".lua")
-							local file_text = file:read("*a")
-							file:close()
-							return file_text
-						end)
-						if cust_fn_text:find("Callbacks") then --declares local variable copies of fn_env globals so they can be used in 'Callbacks' later without being nil
-							local local_txt = ""; for key, value in pairs(fn_env) do local_txt = local_txt .. key..", " end
-							local_txt = "local "..local_txt.."Summon = "..local_txt.."Summon\n"
-							cust_fn_text = local_txt..cust_fn_text
+						sm32.compiled_fn_cache = sm32.compiled_fn_cache or {}
+						local cached_entry = sm32.compiled_fn_cache[cust_fn_text]
+						if cached_entry then
+							nstore.cust_fn_text = cached_entry.text_tbl
+							lua_fn = cached_entry.fn
+							uses_last_hitbox = cached_entry.uses_last_hitbox
+							if imgui_shell and cached_entry.failed then
+								imgui_shell.error_txt = {cached_entry.failed, os.clock()}
+							end
+						else
+							local raw_cust_fn_text = cust_fn_text
+							cust_fn_text = cust_fn_text:gsub("RunLuaFile%(['\"].-['\"]%)", function(found_call)
+								local path = found_call:match("RunLuaFile%(['\"](.-)['\"]%)")
+								local file = io.input("SkillMaker\\CustomFn\\"..path:lower():gsub("%.lua", "")..".lua")
+								local file_text = file:read("*a")
+								file:close()
+								return file_text
+							end)
+							if cust_fn_text:find("Callbacks") then --declares local variable copies of fn_env globals so they can be used in 'Callbacks' later without being nil
+								local local_txt = ""; for key, value in pairs(fn_env) do local_txt = local_txt .. key..", " end
+								local_txt = "local "..local_txt.."Summon = "..local_txt.."Summon\n"
+								cust_fn_text = local_txt..cust_fn_text
+							end
+							local text_tbl = {"\n"..cust_fn_text}
+							local fn, failed = load(cust_fn_text, nil, "t", _G)
+							lua_fn = not failed and fn
+							uses_last_hitbox = cust_fn_text:find("last_hitbox", 1, true) ~= nil
+							sm32.compiled_fn_cache[raw_cust_fn_text] = {
+								fn = lua_fn,
+								failed = failed,
+								text_tbl = text_tbl,
+								uses_last_hitbox = uses_last_hitbox,
+							}
+							nstore.cust_fn_text = text_tbl
+							if imgui_shell then imgui_shell.error_txt = failed and {failed, os.clock()} or imgui_shell.error_txt end
 						end
-						nstore.cust_fn_text = {"\n"..cust_fn_text}
-						local fn, failed = load(cust_fn_text, nil, "t", _G)
-						lua_fn = not failed and fn
-						if imgui_shell then imgui_shell.error_txt = failed and {failed, os.clock()} or imgui_shell.error_txt end
 					end
 					
 					local req_tracks
@@ -7499,8 +7581,16 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 					-- manage every frame:
 					pre_fns[nstore] = function(given_nstore) 
 						nstore = given_nstore or nstore
+						local spell_alive = casted_spells[i] ~= nil and casted_spells[i].storage == storage
+						if not spell_alive then
+							stopped_fn = true
+						end
 						died = nstore.num_living_children == 0 and (died and 1 or true) or false
-						if died == 1 and not casted_spells[i] then pre_fns[nstore] = nil end --kill after 2 frames of no children
+						if died == 1 and (not spell_alive or (stopped_fn and #storage > s)) then
+							pre_fns[nstore] = nil
+							nstore.finished = true
+							return
+						end --kill after 2 frames of no children
 						nstore.num_living_children = 0
 						nstore.final_instance = nstore.children[#nstore.children] or (nstore.instance and nstore.instance["<Shell>k__BackingField"]) --we only want the position of the final child smnode
 						nstore.finished = not pre_fns[nstore] or nil
@@ -7516,11 +7606,13 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 						nstore.instance_pos = nstore.summon_pos or nstore.instance_pos --sm_summons just override shells
 						nstore.p_instance_pos = prev_store and prev_store.instance_pos
 						nstore.p_instance_rot = prev_store and prev_store.instance_rot
-						req_tracks = req_tracks or get_req_tracks(owner)
-						nstore.last_hitbox = req_tracks and (req_tracks.ReqId1 >= 0 or req_tracks.ReqId2 >= 0 or req_tracks.ReqId3 >= 0 or req_tracks.ReqId4 >= 0 or req_tracks.ReqId5 >= 0 
-							or req_tracks.ReqId6 >= 0 or req_tracks.ReqId7 >= 0 or req_tracks.ReqId8 >= 0 or req_tracks.ReqId9 >= 0) and game_time or nstore.last_hitbox
+						if uses_last_hitbox then
+							req_tracks = req_tracks or get_req_tracks(owner)
+							nstore.last_hitbox = req_tracks and (req_tracks.ReqId1 >= 0 or req_tracks.ReqId2 >= 0 or req_tracks.ReqId3 >= 0 or req_tracks.ReqId4 >= 0 or req_tracks.ReqId5 >= 0 
+								or req_tracks.ReqId6 >= 0 or req_tracks.ReqId7 >= 0 or req_tracks.ReqId8 >= 0 or req_tracks.ReqId9 >= 0) and game_time or nstore.last_hitbox
+						end
 						
-						if s == #storage and smnode.pl_velocity_type > 1 then
+						if spell_alive and s == #storage and smnode.pl_velocity_type > 1 then
 							local pl_pos = owner_xform:get_Position()
 							local shell_pos = nstore.pos or nstore.p_instance_pos
 							local em_pos = nstore.pl_soft_lock_pos
@@ -7547,7 +7639,12 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 							--building the environment is guarded: one unresolvable member here used to take
 							--the rest of this manager with it, including the action request that follows it
 							local ok_env, env_err = pcall(function()
-								local nname, nname2 = own_mfsm2:getCurrentNodeName(0) or "", own_mfsm2:getCurrentNodeName(1) or ""
+								local nname, nname2
+								if owner == player and node_name then
+									nname, nname2 = node_name, node_name2 or ""
+								else
+									nname, nname2 = own_mfsm2:getCurrentNodeName(0) or "", own_mfsm2:getCurrentNodeName(1) or ""
+								end
 								fn_env.Shell = (nstore.final_instance and sdk.is_managed_object(nstore.final_instance) and nstore.final_instance:get_Valid()) and nstore.final_instance or nil
 								fn_env.Summon = nstore.summon_inst and sdk.is_managed_object(nstore.summon_inst) and nstore.summon_inst:get_Valid() and nstore.summon_inst
 								fn_env.ActName = nname:match(".+%.(.+)") or nname
@@ -7663,7 +7760,7 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 								--SFX switch, the decorative collider, the damage table and the per-frame manager that
 								--carries speed, attack rate and the position override are all installed.  That is why a
 								--shell with its visuals off produced nothing at all rather than just no visuals.
-								local ok_efx, efx_err = pcall(change_efx2_color, efx2, nstore)
+								local ok_efx, efx_err = pcall(change_efx2_color, efx2, nstore, nil, shell_inst)
 								if not ok_efx and sm32.dbg_on then sm32.dbg("shell", "the effect colour pass raised: "..tostring(efx_err)) end
 							end
 							
@@ -7704,7 +7801,7 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 							local shell_pos
 							
 							--manage the current shell's speed and damage every frame
-														temp_fns[shell_inst] = function() 
+							temp_fns[shell_inst] = function() 
 								if not shell_inst:get_Valid() or (game_time - storage.start > sms.shell_lifetime_limit) or (storage.did_replace_em and (not owner:get_Valid() or owner:get_Hp() <= 0))
 								--'-1' means "leave the shell's own lifetime alone", so it is not a duration to compare
 								--against: 'elapsed > -1' is true on the first call, and the first call happens the moment
@@ -7713,8 +7810,11 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 								--and then went back to the sentinel could carry the flag into exactly that state.
 								or (smnode.do_abs_lifetime and smnode.lifetime >= 0 and game_time - nstore.start > smnode.lifetime) or (smnode.lifetime == -2.0 and (#storage > s+1)) then
 									temp_fns[shell_inst] = nil
+									active_shells[shell_inst] = nil
+									if efx2 then temp_fns[efx2] = nil end
+								else
+									nstore.num_living_children = nstore.num_living_children + 1
 								end
-								nstore.num_living_children = nstore.num_living_children + 1
 								
 								if temp_fns[shell_inst] and xform:get_Valid()  then
 									active_shells[shell_inst] = nstore
@@ -7724,9 +7824,9 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 									work_rate.NextApplyRate = smnode.speed
 									
 									if not nstore.children[1] then
-										for i, child in pairs(func.get_children(xform:get_Children()) or {}) do
-											local child_shell = getC(child:get_GameObject(), "app.Shell")
-											if not temp_fns[child_shell] and child_shell["<RequestId>k__BackingField"] > nstore.req_id and (s == #storage or (storage[s+1] and storage[s+1].cast_type ~= 4)) then 
+										for i, child in pairs(func.get_children(xform) or {}) do
+											local child_shell = func.getC(child:get_GameObject(), "app.Shell")
+											if child_shell and not temp_fns[child_shell] and child_shell["<RequestId>k__BackingField"] > nstore.req_id and (s == #storage or (storage[s+1] and storage[s+1].cast_type ~= 4)) then 
 												table.insert(nstore.children, child_shell)
 												make_temp_fn(child_shell, true)
 												temp_fns[child_shell]()
@@ -7818,28 +7918,112 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 	}
 end
 
+sm32.anim_state_cache = sm32.anim_state_cache or {}
+sm32.spell_state_cache = sm32.spell_state_cache or {}
+
 local function test_animactions_ready(states_tbl, body_word, upperbody_word, body_frame, upperbody_frame)
-	for k, keyword in ipairs(split(states_tbl, ",", true)) do
-		local kw = keyword:gsub("`", "")
-		local kw_only = kw:match("(.*)%(")
-		local search_kw = kw_only or kw
-		local state_ready = body_word:find(search_kw) or upperbody_word:find(search_kw)
-		if state_ready and kw_only then
-			state_ready = false
-			local frames_body = kw:match("%((.+)%)")
-			if frames_body then
-				local frames = split(frames_body, " ", true)
-				state_ready = body_frame > tonumber(frames[1]) and body_frame < tonumber(frames[2])
-			else
-				local frames_upper = kw:match("%[(.+)%]") 
-				if frames_upper then
-					local frames = split(frames_upper, " ", true)
-					state_ready = upperbody_frame > tonumber(frames[1]) and upperbody_frame < tonumber(frames[2])
+	if not states_tbl or states_tbl == "" then return false end
+	local entry = sm32.anim_state_cache[states_tbl]
+	if not entry then
+		entry = { has_backtick = (states_tbl:find("`", 1, true) ~= nil) }
+		for k, keyword in ipairs(split(states_tbl, ",", true)) do
+			local kw = keyword:gsub("`", "")
+			local kw_only = kw:match("(.*)%(")
+			local search_kw = kw_only or kw
+			local is_plain = (search_kw:find("[$^()*+?.%[%]%-%%]") == nil)
+			local item = { search_kw = search_kw, plain = is_plain, has_paren = (kw_only ~= nil), f_type = 0 }
+			if kw_only then
+				local frames_body = kw:match("%((.+)%)")
+				if frames_body then
+					local frames = split(frames_body, " ", true)
+					item.f_type = 1
+					item.f_min = tonumber(frames[1]) or 0
+					item.f_max = tonumber(frames[2]) or 0
+				else
+					local frames_upper = kw:match("%[(.+)%]")
+					if frames_upper then
+						local frames = split(frames_upper, " ", true)
+						item.f_type = 2
+						item.f_min = tonumber(frames[1]) or 0
+						item.f_max = tonumber(frames[2]) or 0
+					end
 				end
+			end
+			entry[#entry + 1] = item
+		end
+		sm32.anim_state_cache[states_tbl] = entry
+	end
+	for k = 1, #entry do
+		local item = entry[k]
+		local search_kw = item.search_kw
+		local plain = item.plain
+		local state_ready = body_word:find(search_kw, 1, plain) or upperbody_word:find(search_kw, 1, plain)
+		if state_ready and item.has_paren then
+			if item.f_type == 1 then
+				state_ready = body_frame > item.f_min and body_frame < item.f_max
+			elseif item.f_type == 2 then
+				state_ready = upperbody_frame > item.f_min and upperbody_frame < item.f_max
+			else
+				state_ready = false
 			end
 		end
 		if state_ready then return true end
 	end
+end
+
+sm32.test_spell_states = function(spell_states, casted_spells_tbl, cur_game_time)
+	if not spell_states or spell_states == "" then return true end
+	if not next(casted_spells_tbl) then return false end
+	local groups = sm32.spell_state_cache[spell_states]
+	if not groups then
+		groups = {}
+		for n, skill_name in ipairs(split(spell_states, ",", true)) do
+			skill_name = skill_name:gsub("^%%", "")
+			local sub_items = {}
+			for s, sub_name in ipairs(split(skill_name, "+", true)) do
+				local sname = sub_name:match("(.*)%(") or sub_name
+				local do_search = (sub_name:sub(1, 1) == "*")
+				if do_search then
+					sname = sname:sub(2, -1)
+				end
+				local range = sub_name:match("%((.+)%)")
+				local r_parts = range and split(range, " ")
+				sub_items[#sub_items + 1] = {
+					sname = sname,
+					do_search = do_search,
+					t_min = (r_parts and tonumber(r_parts[1])) or 0.0,
+					t_max = (r_parts and tonumber(r_parts[2])) or 999999.0,
+				}
+			end
+			groups[#groups + 1] = sub_items
+		end
+		sm32.spell_state_cache[spell_states] = groups
+	end
+	for n = 1, #groups do
+		local sub_items = groups[n]
+		local sub_state = true
+		for s = 1, #sub_items do
+			local item = sub_items[s]
+			local found_idx
+			if item.do_search then
+				for key, tbl in pairs(casted_spells_tbl) do
+					found_idx = tonumber(key) and tbl.name and tbl.name:find(item.sname) and key
+					if found_idx then break end
+				end
+			else
+				found_idx = func.find_key(casted_spells_tbl, item.sname, "name")
+			end
+			sub_state = found_idx and sub_state
+			if sub_state then
+				local stime = cur_game_time - casted_spells_tbl[found_idx].storage.start
+				sub_state = stime >= item.t_min and stime <= item.t_max
+			else
+				break
+			end
+		end
+		if sub_state then return true end
+	end
+	return false
 end
 
 re.on_script_reset(function()
@@ -7857,6 +8041,7 @@ re.on_pre_application_entry("UpdateBehavior", function()
 
 	sm32.prof_begin()
 	local gspeed = sm32.native("via.Application", "via.Application", "get_GlobalSpeed")
+	sm32.frame_paused = (gspeed or 1.0) < 0.01
 	timescale_mult = 1 / ((gspeed and gspeed > 0.0001) and gspeed or 1.0)
 	delta_time = os.clock() - last_time
 	last_time = os.clock()
@@ -7871,7 +8056,8 @@ re.on_pre_application_entry("UpdateBehavior", function()
 	
 	local last_pl_xform = pl_xform
 	player = chr_mgr:get_ManualPlayer()
-	pl_xform = player and player:get_Valid() and player:get_GameObject():get_Transform()
+	local pl_go = player and player:get_Valid() and player:get_GameObject()
+	pl_xform = pl_go and pl_go:get_Transform()
 	camera = sdk.get_primary_camera()
 	cam_matrix = camera and camera:get_WorldMatrix()
 	is_casting = next(casted_spells) and (is_casting or true)
@@ -7949,6 +8135,7 @@ re.on_pre_application_entry("UpdateBehavior", function()
 	--to pay for a cast on every frame it ran, purely because something was running.
 	if sm32.wants_crosshair == nil or was_changed then
 		sm32.ray_for_activate, sm32.ray_for_node = false, false
+		sm32.has_any_enemy_skill = false
 		for i, skill_tbl in ipairs(sms.skills) do
 			if skill_tbl.enabled then
 				if type(skill_tbl.activate_fn) == "string" and skill_tbl.activate_fn:find("Crosshair", 1, true) then
@@ -7965,8 +8152,10 @@ re.on_pre_application_entry("UpdateBehavior", function()
 		--enemy skills read the point through the same names, and run without any of the player-side
 		--gates, so they are counted here too
 		for em_name, skills_list in pairs(sms.enemyskills or {}) do
+			local em_group_enabled = (type(skills_list) == "table" and skills_list.enabled)
 			for i, em_skill in pairs((type(skills_list) == "table" and skills_list.skills) or {}) do
 				if type(em_skill) == "table" and em_skill.enabled then
+					if em_group_enabled then sm32.has_any_enemy_skill = true end
 					for s, smnode in ipairs(em_skill.smnodes or {}) do
 						if type(smnode.custom_fn) == "string" and smnode.custom_fn:find("Crosshair", 1, true) then
 							sm32.ray_for_node = true
@@ -8081,6 +8270,7 @@ re.on_pre_application_entry("UpdateBehavior", function()
 	
 	if (was_changed or needs_setup) then
 		needs_setup = false
+		sm32.gsmax_runtime_cache_sig = nil
 		
 		--Only a connected pad gets the L1/L2 remaps. On keyboard+mouse these writes take the
 		--vanilla "Switch Weapon Skill" assign away - its Action is repurposed and its Button pinned
@@ -8393,9 +8583,8 @@ local gsmx_draw_guard = { player_addr = nil, controller_addr = nil, last_draw = 
 local function gsmx_weapon_state(player_obj, upper_node, full_node)
     local ctrl = player_obj and player_obj["<SheatheDrawController>k__BackingField"]
     local raw = ctrl and ctrl["<IsDraw>k__BackingField"] or false
-    local pa, ca = nil, nil
-    pcall(function() pa = player_obj:get_address() end)
-    if ctrl then pcall(function() ca = ctrl:get_address() end) end
+    local pa = player_obj and player_obj:get_address()
+    local ca = ctrl and ctrl:get_address()
     if gsmx_draw_guard.player_addr ~= pa or gsmx_draw_guard.controller_addr ~= ca then
         gsmx_draw_guard.player_addr, gsmx_draw_guard.controller_addr = pa, ca
         gsmx_draw_guard.first_gate_reported = false
@@ -8430,8 +8619,11 @@ local function gsmx_weapon_state(player_obj, upper_node, full_node)
     return resolved
 end
 
---Internal per-frame deduplication set. Never exposed to custom functions or other mods.
+--Internal per-frame deduplication set and persistent candidate cache. Never exposed to custom functions or other mods.
 local sm32_casted_this_frame = {}
+sm32.gsmax_runtime_skill_idxs = sm32.gsmax_runtime_skill_idxs or {}
+sm32.hk_names = sm32.hk_names or {}
+
 re.on_application_entry("UpdateBehavior", function()
 
 	sm32.prof_begin()
@@ -8454,11 +8646,24 @@ re.on_application_entry("UpdateBehavior", function()
 	local casted_this_frame = sm32_casted_this_frame
 	for key in pairs(casted_this_frame) do casted_this_frame[key] = nil end
 	local is_wp_drawn = gsmx_weapon_state(player, node_name2, node_name)
-	local is_hitbox_frame = false
+	local is_hitbox_frame = nil
 	local stam_mgr = player:get_StaminaManager()
+	local stam_remaining = stam_mgr and stam_mgr["<RemainingAmount>k__BackingField"] or 0
 	local cast_tbl = enemy_casts[next(enemy_casts)]
 	temp.last_cast_skills = {}
 	active_states = {Sprinting=input_proc.DashSwitch and node_name:find("NormalLocomotion"), Airborne=player:get_IsJumpCtrlActive()}
+	for name, kw_list in pairs(state_keywords) do
+		if active_states[name] == nil then
+			local matched = false
+			for k = 1, #kw_list do
+				if node_name:find(kw_list[k]) then
+					matched = true
+					break
+				end
+			end
+			active_states[name] = matched
+		end
+	end
 	local should_move_cam = not _G.lock_on_target and ((sms.move_cam_for_crosshair >= 3 and is_casting == 1) or ((sms.move_cam_for_crosshair == 2 or sms.move_cam_for_crosshair == 4) and is_modifier_down))
 	
 	if should_move_cam or damp_float01._Current < -0.01 then
@@ -8481,108 +8686,154 @@ re.on_application_entry("UpdateBehavior", function()
 		end
 	end
 	
-	-- GSMAX v2 runtime candidate cache.
--- This cache ONLY removes slots that cannot start from input:
---   disabled, or non-auto + unbound.
--- It deliberately preserves original descending slot priority.
--- forced_skill is handled separately so Exec() can still launch any loaded slot.
-local gsmax_runtime_skill_idxs = {}
-local gsmax_runtime_cache_sig = nil
+	-- GSMAX v2 runtime candidate cache (persisted on sm32 across frames).
+	-- This cache ONLY removes slots that cannot start from input:
+	--   disabled, or non-auto + unbound.
+	-- It deliberately preserves original descending slot priority.
+	-- forced_skill is handled separately so Exec() can still launch any loaded slot.
+	local sig = tostring(#sms.skills) .. ":" .. tostring(sms.max_skills)
+	if sm32.gsmax_runtime_cache_sig ~= sig or #sm32.gsmax_runtime_skill_idxs == 0 then
+		sm32.gsmax_runtime_cache_sig = sig
+		local idxs = {}
+		local hk_names = sm32.hk_names
+		for i = #sms.skills, 1, -1 do
+			local hk_name = hk_names[i]
+			if not hk_name then
+				hk_name = "Use Skill "..i
+				hk_names[i] = hk_name
+			end
+			local skill_tbl = sms.skills[i]
+			if skill_tbl and skill_tbl.enabled then
+				local configured_hotkey = sms.hotkeys and sms.hotkeys[hk_name]
+				if skill_tbl.do_auto or (configured_hotkey ~= nil and configured_hotkey ~= "" and configured_hotkey ~= "[Not Bound]") then
+					idxs[#idxs + 1] = i
+				end
+			end
+		end
+		sm32.gsmax_runtime_skill_idxs = idxs
+	end
 
-local function gsmax_rebuild_runtime_skill_cache()
-    local idxs = {}
-    for i = #sms.skills, 1, -1 do
-        local skill_tbl = sms.skills[i]
-        if skill_tbl and skill_tbl.enabled then
-            local configured_hotkey = sms.hotkeys and sms.hotkeys["Use Skill "..i]
-            if skill_tbl.do_auto or (configured_hotkey ~= nil and configured_hotkey ~= "" and configured_hotkey ~= "[Not Bound]") then
-                idxs[#idxs + 1] = i
-            end
-        end
-    end
-    gsmax_runtime_skill_idxs = idxs
-end
+	local gsmax_scan_idxs = sm32.gsmax_runtime_skill_idxs
+	local gsmax_forced_idx = forced_skill and forced_skill[1] or nil
+	local gsmax_scan_pos = 0
+	local gsmax_forced_pending = gsmax_forced_idx ~= nil
+	local hk_names = sm32.hk_names
 
-local function gsmax_refresh_runtime_skill_cache()
-    local sig = tostring(#sms.skills) .. ":" .. tostring(sms.max_skills)
-    if gsmax_runtime_cache_sig ~= sig or #gsmax_runtime_skill_idxs == 0 then
-        gsmax_runtime_cache_sig = sig
-        gsmax_rebuild_runtime_skill_cache()
-    end
-end
+	-- Hoist frame-invariant player properties outside the skill candidate loop
+	local human = player["<Human>k__BackingField"]
+	local job_ctx = human and human["<JobContext>k__BackingField"]
+	local curr_job = job_ctx and job_ctx.CurrentJob
+	local full_layer = player.FullBodyLayer
+	local upper_layer = player.UpperBodyLayer
+	local body_frame = full_layer and full_layer:get_Frame() or 0.0
+	local upperbody_frame = upper_layer and upper_layer:get_Frame() or 0.0
+	local anim_names_resolved = false
+	local anim_name, anim_name2 = "", ""
+	local wep_jobs_resolved = false
+	local equipped_r_weapon, equipped_l_weapon = "Unarmed", "Unarmed"
 
-gsmax_refresh_runtime_skill_cache()
+	while true do
+		if is_paused then break end
+		local i
+		if gsmax_forced_pending then
+			i = gsmax_forced_idx
+			gsmax_forced_pending = false
+		else
+			gsmax_scan_pos = gsmax_scan_pos + 1
+			i = gsmax_scan_idxs[gsmax_scan_pos]
+			if not i then break end
+			if gsmax_forced_idx and i == gsmax_forced_idx then goto next_skill end
+		end
 
-local gsmax_scan_idxs = gsmax_runtime_skill_idxs
-local gsmax_forced_idx = forced_skill and forced_skill[1] or nil
-local gsmax_scan_pos = 0
-local gsmax_forced_pending = gsmax_forced_idx ~= nil
+		local skill_tbl = sms.skills[i]
+		if not skill_tbl then goto next_skill end
 
-while true do
-    if is_paused then break end
-    local i
-    if gsmax_forced_pending then
-        i = gsmax_forced_idx
-        gsmax_forced_pending = false
-    else
-        gsmax_scan_pos = gsmax_scan_pos + 1
-        i = gsmax_scan_idxs[gsmax_scan_pos]
-        if not i then break end
-        if gsmax_forced_idx and i == gsmax_forced_idx then goto next_skill end
-    end
-
-    local skill_tbl = sms.skills[i]
-    if not skill_tbl then goto next_skill end
+		local hk_name = hk_names[i]
+		if not hk_name then
+			hk_name = "Use Skill "..i
+			hk_names[i] = hk_name
+		end
 
 		local mod2_ready = not skill_tbl.use_modifier2 or is_modifier2_down
 		local are_mods_down = is_modifier_down and mod2_ready
 		local modf_ready = mod2_ready and (skill_tbl.state_type_idx ~= 2 or is_modifier_down) 
-		local hotkey_ready = skill_tbl.do_auto or ((skill_tbl.button_press_type == 1 and hk.check_hotkey("Use Skill "..i, 1)) 
-			or (skill_tbl.button_press_type == 2 and hk.check_doubletap("Use Skill "..i)) or (skill_tbl.button_press_type == 3 and hk.check_hold("Use Skill "..i, false, skill_tbl.button_hold_time))) 
+		local hotkey_ready = skill_tbl.do_auto or ((skill_tbl.button_press_type == 1 and hk.check_hotkey(hk_name, 1)) 
+			or (skill_tbl.button_press_type == 2 and hk.check_doubletap(hk_name)) or (skill_tbl.button_press_type == 3 and hk.check_hold(hk_name, false, skill_tbl.button_hold_time))) 
 		
 		if forced_skill and forced_skill[1] == i then
 			local copy_skill = hk.recurse_def_settings({}, skill_tbl)
-			for i, node in ipairs(copy_skill.smnodes) do
+			for idx, node in ipairs(copy_skill.smnodes) do
 				if node.start < forced_skill[2] then
 					node.enabled = false
 				end
 			end
 			cast_spell(copy_skill, forced_skill[1], nil, forced_skill[2])
+			anim_names_resolved = false
+			body_frame = full_layer and full_layer:get_Frame() or 0.0
+			upperbody_frame = upper_layer and upper_layer:get_Frame() or 0.0
 			
-		elseif hotkey_ready and skill_tbl.enabled and modf_ready and (not casted_spells[i] or (skill_tbl.spell_states:find("%%"..skill_tbl.name))) then --"[^%a%c]"..skill_tbl.name.."$?[^%a]"
-			local is_correct_vocation = (skill_tbl.job_idx == 1 or player["<Human>k__BackingField"]["<JobContext>k__BackingField"].CurrentJob == skill_tbl.job_idx - 1)
-			local body_frame, upperbody_frame = player.FullBodyLayer:get_Frame(), player.UpperBodyLayer:get_Frame()
-			local is_action_ready = (skill_tbl.custom_states == "") or test_animactions_ready(skill_tbl.custom_states, node_name, node_name2, body_frame, upperbody_frame)
+		elseif hotkey_ready and skill_tbl.enabled and modf_ready and (not casted_spells[i] or (skill_tbl.spell_states ~= "" and skill_tbl.spell_states:find("%%"..skill_tbl.name))) then --"[^%a%c]"..skill_tbl.name.."$?[^%a]"
+			local is_correct_vocation = (skill_tbl.job_idx == 1 or curr_job == skill_tbl.job_idx - 1)
+			if not is_correct_vocation or (skill_tbl.stam_cost ~= 0 and stam_remaining <= 0) or casted_this_frame[hk.hotkeys[hk_name] ] then
+				goto next_skill
+			end
+
+			local required_skill_active = (skill_tbl.spell_states == "") or sm32.test_spell_states(skill_tbl.spell_states, casted_spells, game_time)
+			if not required_skill_active and not sm32.dbg_on then
+				goto next_skill
+			end
+
 			local is_state_ready = false
 			for name, state in pairs(skill_tbl.states) do
-				for k, keyword in ipairs(state_keywords[name] or {}) do
-					active_states[name] = active_states[name] or node_name:find(keyword)
-					is_state_ready = is_state_ready or (state and active_states[name])
+				if state and active_states[name] then
+					is_state_ready = true
+					break
 				end
 			end
-			
-			if skill_tbl.custom_states:find("`") then
+
+			local custom_states_str = skill_tbl.custom_states
+			local has_backtick = (custom_states_str ~= "" and custom_states_str:find("`", 1, true) ~= nil)
+			if not is_state_ready and not has_backtick then
+				goto next_skill
+			end
+
+			local is_action_ready = (custom_states_str == "") or test_animactions_ready(custom_states_str, node_name, node_name2, body_frame, upperbody_frame)
+			if has_backtick then
 				is_state_ready = is_state_ready or is_action_ready
 				is_action_ready = is_action_ready or is_state_ready
+			end
+			if not (is_action_ready and is_state_ready) then
+				goto next_skill
 			end
 			
 			local is_anim_ready = (skill_tbl.anim_states == "")
 			if not is_anim_ready then
-				local mot_info, mot_info2 = player.FullBodyLayer:get_HighestWeightMotionNode(), player.UpperBodyLayer:get_HighestWeightMotionNode()
-				local anim_name, anim_name2 = mot_info and mot_info:get_MotionName() or "", mot_info2 and mot_info2:get_MotionName() or ""
+				if not anim_names_resolved then
+					local mot_info = full_layer and full_layer:get_HighestWeightMotionNode()
+					local mot_info2 = upper_layer and upper_layer:get_HighestWeightMotionNode()
+					anim_name = mot_info and mot_info:get_MotionName() or ""
+					anim_name2 = mot_info2 and mot_info2:get_MotionName() or ""
+					anim_names_resolved = true
+				end
 				is_anim_ready = test_animactions_ready(skill_tbl.anim_states, anim_name, anim_name2, body_frame, upperbody_frame)
 			end
 			
-			if is_correct_vocation and is_action_ready and is_state_ready and is_anim_ready and (skill_tbl.stam_cost == 0 or stam_mgr["<RemainingAmount>k__BackingField"] > 0) and not casted_this_frame[hk.hotkeys["Use Skill "..i] ] then
+			if is_anim_ready then
 				-- AIR_DRAW_DIAG confirmed that a valid first airborne skill can have
 				-- Airborne=true while Falling=nil and skill.states.Falling=false.
 				-- In that exact bootstrap state, trust the actually equipped weapon instead
 				-- of converting it to Unarmed only because the game's IsDraw flag is stale.
+				if not wep_jobs_resolved then
+					local holder = player:get_WeaponAndItemHolder()
+					equipped_r_weapon = holder and weps.getWeaponJob(holder:get_RightWeapon(), weps.job_to_wp_map) or "Unarmed"
+					equipped_l_weapon = holder and weps.getWeaponJob(holder:get_LeftWeapon(), weps.job_to_sub_wp_map) or "Unarmed"
+					wep_jobs_resolved = true
+				end
 				local airborne_skill_bootstrap = active_states.Airborne
 					and skill_tbl.require_weapon and not is_wp_drawn
 				local curr_r_weapon = (not is_wp_drawn and not airborne_skill_bootstrap) and "Unarmed"
-					or weps.getWeaponJob(player:get_WeaponAndItemHolder():get_RightWeapon(), weps.job_to_wp_map)
-				local curr_l_weapon = weps.getWeaponJob(player:get_WeaponAndItemHolder():get_LeftWeapon(), weps.job_to_sub_wp_map)
+					or equipped_r_weapon
+				local curr_l_weapon = equipped_l_weapon
 				local is_correct_weapon = skill_tbl.wp_idx == 1 or (skill_tbl.wp_idx == 2 and curr_r_weapon == "Unarmed") or weps.types[skill_tbl.wp_idx] == curr_r_weapon or weps.types[skill_tbl.wp_idx] == curr_l_weapon or (skill_tbl.wp_idx == 14 and curr_l_weapon:find("Bow")) 
 					or (skill_tbl.wp_idx == 15 and curr_r_weapon:find("Staff")) or (skill_tbl.wp_idx == 13 and (curr_r_weapon == "Sword" or curr_r_weapon == "Two-Hander" or curr_r_weapon == "Dagger" or curr_r_weapon == "Duospear"))
 				local is_basic_ready = (skill_tbl.state_type_idx ~= 4 or not (is_sws_down and not are_mods_down)) and (skill_tbl.state_type_idx ~= 3 or (is_sws_down and not are_mods_down))
@@ -8590,12 +8841,13 @@ while true do
 				local is_upperbody_frame_ready = (skill_tbl.frame_range_upper[1] == -1.0 or upperbody_frame >= skill_tbl.frame_range_upper[1]) and (skill_tbl.frame_range_upper[2] == -1.0 or upperbody_frame <= skill_tbl.frame_range_upper[2])
 				local wep_ready = (not skill_tbl.require_weapon or is_wp_drawn or airborne_skill_bootstrap)
 				
-				local hitbox_ready = not skill_tbl.require_hitbox or is_hitbox_frame
+				local hitbox_ready = not skill_tbl.require_hitbox
 				if not hitbox_ready then
-					local hit = player:get_Hit()
-					local req_tracks = get_req_tracks(player)
-					if req_tracks == nil then sm32.dbg("gate", "no app.ColliderReqTracks on the player, 'Require Hitbox' can never be satisfied") end
-					is_hitbox_frame = is_hitbox_frame or (req_tracks ~= nil and (req_tracks.ReqId1 >= 0 or req_tracks.ReqId2 >= 0 or req_tracks.ReqId3 >= 0 or req_tracks.ReqId4 >= 0 or req_tracks.ReqId5 >= 0 or req_tracks.ReqId6 >= 0 or req_tracks.ReqId7 >= 0 or req_tracks.ReqId8 >= 0 or req_tracks.ReqId9 >= 0))
+					if is_hitbox_frame == nil then
+						local req_tracks = get_req_tracks(player)
+						if req_tracks == nil then sm32.dbg("gate", "no app.ColliderReqTracks on the player, 'Require Hitbox' can never be satisfied") end
+						is_hitbox_frame = (req_tracks ~= nil and (req_tracks.ReqId1 >= 0 or req_tracks.ReqId2 >= 0 or req_tracks.ReqId3 >= 0 or req_tracks.ReqId4 >= 0 or req_tracks.ReqId5 >= 0 or req_tracks.ReqId6 >= 0 or req_tracks.ReqId7 >= 0 or req_tracks.ReqId8 >= 0 or req_tracks.ReqId9 >= 0)) or false
+					end
 					hitbox_ready = is_hitbox_frame and (not skill_tbl.require_hitbox_contact or (game_time - temp.last_pl_hit_landed) < 0.05)
 				end
 				
@@ -8605,9 +8857,10 @@ while true do
 					mt.__index = mt
 				end
 				
+				local is_activate_ready = required_skill_active and cast_prep_type == 0 and is_body_frame_ready and is_upperbody_frame_ready and is_basic_ready and hitbox_ready
 				local skill_storage = {}
 				local custom_fn_ready = skill_tbl.activate_fn == ""
-				if not custom_fn_ready then
+				if not custom_fn_ready and (is_activate_ready or sm32.dbg_on) then
 					local fn_env = {ActName=node_name:match(".+%.(.+)"), ActName2=node_name2 and node_name2:match(".+%.(.+)"), SkillData=skill_tbl, Skill=skill_storage}
 					fn_env.Exec = function(skill_name) 
 						local skill_idx = func.find_key(sms.last_sel_spells, skill_name)
@@ -8616,38 +8869,23 @@ while true do
 					fn_env.Kill = function(skill_name) 
 						if active_skills[skill_name] then casted_spells[active_skills[skill_name].idx] = nil end
 					end
-					local try, output = pcall(load(skill_tbl.activate_fn, nil, "t", hk.merge_tables(_G, fn_env)))
+					sm32.compiled_fn_cache = sm32.compiled_fn_cache or {}
+					local act_fn_entry = sm32.compiled_fn_cache[skill_tbl.activate_fn]
+					if not act_fn_entry then
+						local fn, failed = load(skill_tbl.activate_fn, nil, "t", _G)
+						act_fn_entry = { fn = not failed and fn or nil, failed = failed }
+						sm32.compiled_fn_cache[skill_tbl.activate_fn] = act_fn_entry
+					end
+					hk.merge_tables(_G, fn_env)
+					local try, output
+					if act_fn_entry.fn then
+						try, output = pcall(act_fn_entry.fn)
+					else
+						try, output = false, act_fn_entry.failed
+					end
 					sm32.fn_env_clear(fn_env)
 					if imgui_skills[i] then imgui_skills[i].error_txt = not try and {output, os.clock()} or imgui_skills[i].error_txt end
 					custom_fn_ready = try and output
-				end
-				
-				local required_skill_active = skill_tbl.spell_states == ""
-				if not required_skill_active then
-					for n, skill_name in ipairs(split(skill_tbl.spell_states, ",", true)) do
-						skill_name = skill_name:gsub("^%%", "")
-						local sub_state = true
-						for s, sub_name in ipairs(split(skill_name, "+", true)) do
-							local sname = sub_name:match("(.*)%(") or sub_name
-							local do_search, found_idx = (sub_name:sub(1,1) == "*")
-							if do_search then 
-								sname = sname:sub(2,-1)
-								for key, tbl in pairs(casted_spells) do 
-									found_idx = tonumber(key) and tbl.name and tbl.name:find(sname) and key --FIXME
-									if found_idx then break end
-								end
-							else
-								found_idx = func.find_key(casted_spells, sname, "name")
-							end
-							sub_state = found_idx and sub_state
-							if sub_state then
-								local stime = game_time - casted_spells[found_idx].storage.start
-								local range = sub_name:match("%((.+)%)"); range = range and split(range, " ")
-								sub_state = stime >= (range and tonumber(range[1]) or 0.0) and stime <= (range and tonumber(range[2]) or 999999.0)
-							end
-						end
-						required_skill_active = required_skill_active or sub_state
-					end
 				end
 				
 				--'Require Weapon Drawn' used to force a DrawWeapon before any of the other gates were
@@ -8656,7 +8894,6 @@ while true do
 				--sheathe state first. is_correct_weapon stays on the cast branch on purpose:
 				--curr_r_weapon is forced to "Unarmed" while sheathed, so pre-gating it would break
 				--the legitimate "draw first, then the weapon type matches" flow.
-				local is_activate_ready = required_skill_active and cast_prep_type == 0 and is_body_frame_ready and is_upperbody_frame_ready and is_basic_ready and hitbox_ready
 				if sm32.dbg_on and not (is_activate_ready and custom_fn_ready and wep_ready and is_correct_weapon) then
 					local blocked = {}
 					if not required_skill_active then blocked[#blocked+1] = "Required Skills" end
@@ -8676,11 +8913,14 @@ while true do
 					player["<ActionManager>k__BackingField"]:requestActionCore(0, "DrawWeapon", 1)
 					goto exit
 				elseif is_correct_weapon then
-					casted_this_frame[hk.hotkeys["Use Skill "..i] ] = true
+					casted_this_frame[hk.hotkeys[hk_name] ] = true
 					if active_states.Falling and skill_tbl.states.Falling then --reset fall on midair cast
 						reset_fall_height(3.0)
 					end
 					cast_spell(skill_tbl, i, nil, nil, skill_storage)
+					anim_names_resolved = false
+					body_frame = full_layer and full_layer:get_Frame() or 0.0
+					upperbody_frame = upper_layer and upper_layer:get_Frame() or 0.0
 				end
 			end
 		end
@@ -8868,15 +9108,19 @@ end)
 
 re.on_draw_ui(function()
     -- GSMAX Headless Runtime intentionally exposes no in-game Skill Maker editor UI.
+    if imgui.tree_node("Skill Maker") then
+		display_mod_imgui()
+		imgui.tree_pop()
+	end
 end)
 
 sm32.hook("app.CharacterInput", "set_AxisL", function(args)
-    local gspeed = sm32.native("via.Application", "via.Application", "get_GlobalSpeed")
-    is_paused, real_rad_l = (gspeed or 1.0) < 0.01
+	is_paused, real_rad_l = sm32.frame_paused or false, nil
 	if do_inhibit_all_buttons then 
 		real_rad_l = sdk.to_valuetype(args[3], "via.vec2")
 		real_rad_l = -math.atan(math.floor(real_rad_l.x * 10 + 0.5)/10,  math.floor(real_rad_l.y * 10 + 0.5)/10)-- - math.pi
-		args[3] = sdk.to_ptr(ValueType.new(sdk.find_type_definition("via.vec2")):get_address())
+		sm32.zero_vec2_ptr = sm32.zero_vec2_ptr or sdk.to_ptr(ValueType.new(sdk.find_type_definition("via.vec2")):get_address())
+		args[3] = sm32.zero_vec2_ptr
 	end
 end)
 
@@ -8984,31 +9228,50 @@ sm32.hook("app.BattleRelationshipHolder", "getRelationshipFromTo(app.Character, 
 		--runs thousands of times a second whether one is or not.  The answer is decided first, so a
 		--frame with nothing running does not even reach the per-thread storage.
 		if not (is_summoning or is_casting) then return end
-		if sdk.to_int64(args[4]) == 0 then return end
-		thread.get_hook_storage().args = args
+		local hstore = thread.get_hook_storage()
+		if sdk.to_int64(args[4]) == 0 then
+			hstore.args = nil
+			return
+		end
+		if not is_summoning and (not is_battling or not player or sdk.to_int64(args[3]) ~= player:get_address()) then
+			hstore.args = nil
+			return
+		end
+		hstore.args = args
 	end,
 	function(retval)
 		if not (is_summoning or is_casting) then return retval end
-		local args = thread.get_hook_storage().args
-		if args and (is_summoning or (is_casting and is_battling and sdk.to_int64(args[3]) == player:get_address())) then
+		local hstore = thread.get_hook_storage()
+		local args = hstore.args
+		if args and (is_summoning or (is_casting and is_battling and player and sdk.to_int64(args[3]) == player:get_address())) then
+			hstore.args = nil
 			local cha1 = sdk.to_managed_object(args[3])
 			local cha2 = sdk.to_managed_object(args[4])
 			-- GSMAX: relationship callbacks can carry a stale/invalid managed character.
 			-- Do not dereference it; preserve the game's original relationship result.
-			if not cha1 or not cha2 then return retval end
-			local cha2_go = nil
-			local cha2_go_ok = pcall(function() cha2_go = cha2:get_GameObject() end)
-			if not cha2_go_ok or not cha2_go then return retval end
-			if cha1 == cha2 then return retval end
-			if cha1 == player then 
-				if is_battling and sdk.to_int64(retval) == 0 and func.getC(cha2_go, "app.NPCBehavior") then return sdk.to_ptr(2) end --Spells wont hit neutral NPCs during combat
-				if sm_summons[cha2] then return sdk.to_ptr(is_battling and 2 or 0) end
-			end
+			if not cha1 or not cha2 or cha1 == cha2 then return retval end
+			if cha1 == player and sm_summons[cha2] then return sdk.to_ptr(is_battling and 2 or 0) end
 			local rels = rel_db[cha1]
 			if rels and rels[cha2] ~= nil then 
 				if not rels[cha2] then return retval end
-				retval = sdk.to_ptr(rels[cha2])
-			else
+				return sdk.to_ptr(rels[cha2])
+			end
+			local cha2_go = nil
+			local cha2_go_ok = pcall(function() cha2_go = cha2:get_GameObject() end)
+			if not cha2_go_ok or not cha2_go then return retval end
+			if cha1 == player and not is_summoning then
+				if not rels then rel_db[cha1] = {} end
+				if is_battling and sdk.to_int64(retval) == 0 and func.getC(cha2_go, "app.NPCBehavior") then
+					rel_db[cha1][cha2] = 2
+					return sdk.to_ptr(2) --Spells wont hit neutral NPCs during combat
+				end
+				rel_db[cha1][cha2] = false
+				return retval
+			end
+			if cha1 == player then 
+				if is_battling and sdk.to_int64(retval) == 0 and func.getC(cha2_go, "app.NPCBehavior") then return sdk.to_ptr(2) end --Spells wont hit neutral NPCs during combat
+			end
+			do
 				local out
 				local summon_1 = sm_summons[cha1]
 				local summon_2 = sm_summons[cha2]
@@ -9100,7 +9363,7 @@ sm32.hook("app.HumanShootArrow", "start(via.behaviortree.ActionArg)", function(a
 end)
 
 sm32.hook("app.TurnController", "updateAngle", function(args)
-	if is_paused then return end
+	if is_paused or not next(turn_fns) then return end
 	local turn_ctrl = sdk.to_managed_object(args[2])
 	if turn_fns[turn_ctrl] then
 		turn_fns[turn_ctrl]()
@@ -9109,6 +9372,7 @@ end)
 
 sm32.hook("app.Shell", "checkFinish", 
 	function(args)
+		if not next(active_shells) then return end
 		local shell = sdk.to_managed_object(args[2])
 		local nstore = active_shells[shell]
 		local timer = nstore and nstore.shell.do_abs_lifetime and not shell["<TerrainHitResult>k__BackingField"] and not nstore.children[1] and shell["<LiveTimer>k__BackingField"]
@@ -9117,6 +9381,7 @@ sm32.hook("app.Shell", "checkFinish",
 		end
 	end,
 	function(retval)
+		if not next(active_shells) then return retval end
 		return thread.get_hook_storage().retval or retval
 	end
 )
@@ -9182,10 +9447,13 @@ end
 
 --Enemy Skills are evaluated and launched here
 sm32.hook("app.ActionManager", "requestActionCore(app.ActionManager.Priority, System.String, System.UInt32)", function(args)
-	if player and not is_paused and not next(enemy_casts) then
+	if sm32.has_any_enemy_skill and player and not is_paused and not next(enemy_casts) then
 		local em_act = sdk.to_managed_object(args[2])
-		local gameobj = em_act:get_GameObject()
+		if not em_act then return end
+		local ok_go, gameobj = pcall(em_act.get_GameObject, em_act)
+		if not ok_go or not gameobj then return end
 		local em_chr = func.getC(gameobj, "app.Character")
+		if not em_chr then return end
 		local em_ch_name = enums.chara_id_enum[em_chr:get_CharaID()] or ""
 		local em_tbl = enemy_list[em_ch_name] or enemy_list[em_ch_name:sub(1,3)]
 		if not em_tbl or em_tbl.is_animal then return end
@@ -9359,8 +9627,8 @@ end, nil, true)
 sm32.hook("app.HitController", "getReactionDamageType(app.HitController.DamageInfo)", 
 	function(args)
 		local hit_info = sdk.to_managed_object(args[3])
-		hit = hit_info:get_AttackHitController()
-		if hit == player:get_Hit() then temp.last_pl_hit_landed = game_time end
+		local hit = hit_info:get_AttackHitController()
+		if player and hit == player["<Hit>k__BackingField"] then temp.last_pl_hit_landed = game_time end
 		local nstore = dmg_tbl[hit]
 		
 		if nstore then 
@@ -9438,19 +9706,27 @@ end)
 
 sm32.hook("app.Shell", "requestOmenEffect", 
 	function(args)
-		local hstore = thread.get_hook_storage()
-		hstore.shell = sdk.to_managed_object(args[2])
-		hstore.nstore = temp.omen_reqs[hstore.shell]
+		if not next(temp.omen_reqs) then return end
+		local shell = sdk.to_managed_object(args[2])
+		local nstore = temp.omen_reqs[shell]
+		if nstore then
+			local hstore = thread.get_hook_storage()
+			hstore.shell = shell
+			hstore.nstore = nstore
+		end
 	end,
 	function(retval)
+		if not next(temp.omen_reqs) then return retval end
 		local hstore = thread.get_hook_storage() 
 		if hstore.nstore then
+			local nstore = hstore.nstore
+			hstore.nstore = nil
 			temp.omen_reqs[hstore.shell] = nil
 			--this runs inside the engine's own call frame, so nothing here may raise: a missing effect
 			--manager would otherwise index the update-function table with nil
 			local omen_efx2 = hstore.shell["<EffectManager2>k__BackingField"]
 			if omen_efx2 then
-				local ok_omen, omen_err = pcall(change_efx2_color, omen_efx2, hstore.nstore)
+				local ok_omen, omen_err = pcall(change_efx2_color, omen_efx2, nstore, nil, hstore.shell)
 				if not ok_omen and sm32.dbg_on then sm32.dbg("shell", "the omen effect colour pass raised: "..tostring(omen_err)) end
 			end
 		end

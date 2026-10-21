@@ -55,7 +55,7 @@ local cfg = {
 
     -- Warrior exclusive debuff:
     -- stamina loss ratio = final incoming damage / MaxHP.
-    damage_stamina_debuff = true,
+    damage_stamina_debuff = false,
     damage_stamina_cooldown = 10.0,
 }
 
@@ -233,14 +233,13 @@ local function gsmax_hb_set_epv_scale_1_5(created_container, absolute_scale)
 end
 
 -- Arc of Might / Arc of Obliteration gold VFX: edit timings and offsets here.
-local ARC_GOLD1_FRAME = 39.48
+local ARC_GOLD1_FRAME = 39.58
 local ARC_GOLD2_FRAME = 80.72
 -- Gold2 uses the same PLAYER-FORWARD offset as Thrust EX ground impact.
 -- Origin: weapon Rot joint; direction: player's horizontal forward (+Z rotated by player quaternion).
 -- This is NOT a fixed world-space XYZ offset, nor weapon-facing offset.
 local ARC_GOLD2_FORWARD_OFFSET = 1.25
-local ARC_GOLD1_SCALE = 1.52 -- only gold {10,6,20}; HolyBurst keeps 1.15
-local ARC_GOLD2_SCALE = 2.48 -- only gold {10,6,21}; HolyBurst keeps 1.15
+local ARC_GOLD2_SCALE = 1.82 -- only gold {10,6,21}; HolyBurst keeps 1.15
 local function play_holybrust_standalone(force_ex, arc_gold_element)
     if not arc_gold_element and not force_ex and not cfg.chain_holybrust_bonus then return nil end
     local source = state.player
@@ -356,14 +355,12 @@ local function play_holybrust_standalone(force_ex, arc_gold_element)
         warn("HolyBrust: requestEffect failed")
         return nil
     end
-	
-	if arc_gold_element == 20 then
-        gsmax_hb_set_epv_scale_1_5(result, ARC_GOLD1_SCALE)
-	elseif arc_gold_element == 21 then
-		gsmax_hb_set_epv_scale_1_5(result, ARC_GOLD2_SCALE)
-	else
-		gsmax_hb_set_epv_scale_1_5(result)
-	end
+
+    if arc_gold_element == 21 then
+        gsmax_hb_set_epv_scale_1_5(result, ARC_GOLD2_SCALE)
+    elseif not arc_gold_element then
+        gsmax_hb_set_epv_scale_1_5(result)
+    end
     return result
 end
 
@@ -511,7 +508,16 @@ end
 local function color_arcroar_vfx()
     local efx2 = state.arcroar_vfx_efx2
     if not efx2 then return end
-    local color = make_tu32_color(ARCROAR_VFX.r, ARCROAR_VFX.g, ARCROAR_VFX.b, ARCROAR_VFX.a)
+    local tick = state.frame_id or 0
+    if state.arcroar_vfx_last_tick and (tick - state.arcroar_vfx_last_tick) < 3 then
+        return
+    end
+    state.arcroar_vfx_last_tick = tick
+    local color = state.arcroar_vfx_color
+    if not color then
+        color = make_tu32_color(ARCROAR_VFX.r, ARCROAR_VFX.g, ARCROAR_VFX.b, ARCROAR_VFX.a)
+        state.arcroar_vfx_color = color
+    end
     if not color then return end
 
     pcall(function()
@@ -520,11 +526,13 @@ local function color_arcroar_vfx()
         if not items then return end
         for di=0,63 do
             local data = nil; pcall(function() data = items[di] end)
-            local effects = data and data.list and data.list._items or nil
+            if not data then break end
+            local effects = data.list and data.list._items or nil
             if effects then
                 for ci=0,63 do
                     local ce = nil; pcall(function() ce = effects[ci] end)
-                    if ce and ce.IsFinished ~= true then
+                    if not ce then break end
+                    if ce.IsFinished ~= true then
                         local key = tostring(ce)
                         if not state.arcroar_vfx_seen[key] then
                             state.arcroar_vfx_seen[key] = true
@@ -533,19 +541,17 @@ local function color_arcroar_vfx()
                             if entries then
                                 for ei=0,63 do
                                     local entry=nil; pcall(function() entry=entries[ei] end)
-                                    if entry then
-                                        local value=nil
-                                        pcall(function() value=entry.value end)
-                                        if not value then pcall(function() value=entry._value end) end
-                                        local arr=value and value._items or nil
-                                        if arr then
-                                            for pi=0,31 do
-                                                local ep=nil; pcall(function() ep=arr[pi] end)
-                                                if ep then
-                                                    local okc=pcall(function() ep:set_Color(color) end)
-                                                    if not okc then pcall(function() ep:call("set_Color(via.Color)", color) end) end
-                                                end
-                                            end
+                                    if not entry then break end
+                                    local value=nil
+                                    pcall(function() value=entry.value end)
+                                    if not value then pcall(function() value=entry._value end) end
+                                    local arr=value and value._items or nil
+                                    if arr then
+                                        for pi=0,31 do
+                                            local ep=nil; pcall(function() ep=arr[pi] end)
+                                            if not ep then break end
+                                            local okc=pcall(function() ep:set_Color(color) end)
+                                            if not okc then pcall(function() ep:call("set_Color(via.Color)", color) end) end
                                         end
                                     end
                                 end
@@ -601,6 +607,7 @@ local function spawn_arcroar_vfx()
         state.arcroar_vfx_xform = nil
         state.arcroar_vfx_efx2 = nil
         state.arcroar_vfx_seen = {}
+        state.arcroar_vfx_last_tick = nil
         state.arcroar_vfx_watch_remaining = 0.0
         return true
     end
@@ -620,6 +627,7 @@ local function resolve_arcroar_vfx()
         state.arcroar_vfx_shell = shell
         state.arcroar_vfx_xform = go and go:get_Transform() or nil
         state.arcroar_vfx_efx2 = go and get_component_fast(go, "via.effect.script.ObjectEffectManager2") or nil
+        state.arcroar_vfx_last_tick = nil
 
         -- MAX ArcRoarVFX2 node5: scale [1.4, 1.4, 1.4].
         -- Apply once when the runtime shell resolves; position/rotation follow remains unchanged.
@@ -714,41 +722,68 @@ local function same_game_object(a, b)
 end
 
 local function is_player_owned(obj)
+    if not obj then return false end
     local pl = state.player or get_player()
-    if not pl or not obj then return false end
-    if obj:get_address() == pl:get_address() then return true end
+    if not pl then return false end
+    if obj == pl or (state.player_act_mgr and obj == state.player_act_mgr) then return true end
+    local ok, addr = pcall(obj.get_address, obj)
+    if not ok or not addr then return false end
+    local pl_addr = state.player_addr or pl:get_address()
+    if addr == pl_addr then return true end
+    if state.player_act_mgr_addr then
+        return addr == state.player_act_mgr_addr
+    end
     return same_game_object(obj, pl)
 end
 
 local function refresh_player()
+    local frame_id = state.frame_id or 0
+    if frame_id > 0 and state.last_refresh_frame == frame_id and state.player then
+        if state.human then
+            state.skillState = safe_get(state.human, "<CustomSkillState>k__BackingField")
+        end
+        return true
+    end
     local pl = get_player()
     if not pl then
-        state.player, state.human, state.motion, state.fullLayer, state.input = nil, nil, nil, nil, nil
+        state.player, state.player_addr, state.player_act_mgr, state.player_act_mgr_addr = nil, nil, nil, nil
+        state.human, state.motion, state.fullLayer, state.input = nil, nil, nil, nil
+        state.last_refresh_frame = nil
         return false
     end
 
-    state.player = pl
-    state.human = safe_call(pl, "get_Human()") or safe_call(pl, "get_Human") or safe_get(pl, "<Human>k__BackingField")
-    state.motion = safe_call(pl, "get_Motion()") or safe_call(pl, "get_Motion")
-    if state.motion then
-        state.fullLayer = safe_call(state.motion, "getLayer(System.UInt32)", 0)
-            or safe_call(state.motion, "getLayer", 0)
-            or safe_call(state.motion, "get_Layer", 0)
-    end
+    local pl_addr = pl:get_address()
+    if state.player_addr ~= pl_addr or not state.human or not state.motion or not state.fullLayer then
+        state.player = pl
+        state.player_addr = pl_addr
+        state.player_act_mgr = safe_get(pl, "<ActionManager>k__BackingField")
+            or safe_call(pl, "get_ActionManager()")
+        state.player_act_mgr_addr = state.player_act_mgr and state.player_act_mgr:get_address() or nil
+        state.human = safe_get(pl, "<Human>k__BackingField") or safe_call(pl, "get_Human()") or safe_call(pl, "get_Human")
+        state.motion = safe_call(pl, "get_Motion()") or safe_call(pl, "get_Motion")
+        if state.motion then
+            state.fullLayer = safe_call(state.motion, "getLayer(System.UInt32)", 0)
+                or safe_call(state.motion, "getLayer", 0)
+                or safe_call(state.motion, "get_Layer", 0)
+        end
 
-    -- Dullahan's PlayerProperties exposes p.input:isButtonOn(mask).
-    -- Try the common DD2 ownership chains without taking a dependency on Dullahan.
-    state.input = safe_call(pl, "get_Input()") or safe_call(pl, "get_Input")
-    if not state.input and state.human then
-        state.input = safe_call(state.human, "get_Input()") or safe_call(state.human, "get_Input")
-            or safe_get(state.human, "<Input>k__BackingField")
-            or safe_get(state.human, "Input")
+        -- Dullahan's PlayerProperties exposes p.input:isButtonOn(mask).
+        -- Try the common DD2 ownership chains without taking a dependency on Dullahan.
+        state.input = safe_call(pl, "get_Input()") or safe_call(pl, "get_Input")
+        if not state.input and state.human then
+            state.input = safe_call(state.human, "get_Input()") or safe_call(state.human, "get_Input")
+                or safe_get(state.human, "<Input>k__BackingField")
+                or safe_get(state.human, "Input")
+        end
+    else
+        state.player = pl
     end
 
     state.weaponJob = safe_call(pl, "getWeaponJob()") or safe_call(pl, "getWeaponJob")
     if state.human then
         state.skillState = safe_get(state.human, "<CustomSkillState>k__BackingField")
     end
+    state.last_refresh_frame = frame_id
     return true
 end
 
@@ -778,9 +813,8 @@ local function set_params()
 
     if cfg.tidal_wrath then
         params.CounterAttackParam.ContinueTime = 40
-        params.CounterAttackParam.JustTime = 2
-        params.CounterAttackParam.Lv2JustTime = 4
-		params.CounterAttackParam.LvExJustTime = 6
+        params.CounterAttackParam.JustTime = 4
+        params.CounterAttackParam.Lv2JustTime = 8
         params.CounterAttackParam.GuardAngle.x = -135
         params.CounterAttackParam.GuardAngle.y = 135
     end
@@ -1163,33 +1197,43 @@ if damage_method then
     sdk.hook(damage_method,
         function(args)
             state.arcroar_damage_pending = false
-            thread.get_hook_storage()["GSMAX_ArcRoar_DamageInfo"] = nil
-            thread.get_hook_storage()["GSMAX_LightChain_DamageInfo"] = nil
-            thread.get_hook_storage()["GSMAX_ArcObliteration_TriggerDI"] = nil
-            thread.get_hook_storage()["GSMAX_ArcObliteration_BuffDI"] = nil
-            thread.get_hook_storage()["GSMAX_ArcObliteration_HolyBrustDI"] = nil
-            thread.get_hook_storage()["GSMAX_HorizontalSlashFull_TriggerDI"] = nil
-            thread.get_hook_storage()["GSMAX_HorizontalSlashFull_BuffDI"] = nil
-            thread.get_hook_storage()["GSMAX_HorizontalSlashFull_EffectDI"] = nil
-            thread.get_hook_storage()["GSMAX_HorizontalSlashEX_ThirdDI"] = nil
-            thread.get_hook_storage()["GSMAX_Warrior_IncomingDamageDI"] = nil
-            thread.get_hook_storage()["GSMAX_ThrustEX_FinishDI"] = nil
+            if state.calc_damage_has_ctx then
+                state.calc_damage_has_ctx = false
+                local hstore = thread.get_hook_storage()
+                if hstore then
+                    hstore["GSMAX_ArcRoar_DamageInfo"] = nil
+                    hstore["GSMAX_LightChain_DamageInfo"] = nil
+                    hstore["GSMAX_ArcObliteration_TriggerDI"] = nil
+                    hstore["GSMAX_ArcObliteration_BuffDI"] = nil
+                    hstore["GSMAX_ArcObliteration_HolyBrustDI"] = nil
+                    hstore["GSMAX_HorizontalSlashFull_TriggerDI"] = nil
+                    hstore["GSMAX_HorizontalSlashFull_BuffDI"] = nil
+                    hstore["GSMAX_HorizontalSlashFull_EffectDI"] = nil
+                    hstore["GSMAX_HorizontalSlashEX_ThirdDI"] = nil
+                    hstore["GSMAX_Warrior_IncomingDamageDI"] = nil
+                    hstore["GSMAX_ThrustEX_FinishDI"] = nil
+                end
+            end
 
             local di = sdk.to_managed_object(args[3])
             if not di then return end
 
             local ahc = safe_get(di, "<AttackHitController>k__BackingField")
-            if ahc then
-                local shell = safe_get(ahc, "<CachedShell>k__BackingField")
-                local attacker = shell and safe_get(shell, "<OwnerCharacter>k__BackingField")
-                    or safe_get(ahc, "<CachedCharacter>k__BackingField")
+            local shell = ahc and safe_get(ahc, "<CachedShell>k__BackingField") or nil
+            local attacker = ahc and (shell and safe_get(shell, "<OwnerCharacter>k__BackingField")
+                or safe_get(ahc, "<CachedCharacter>k__BackingField")) or nil
+            local attacker_is_player = attacker ~= nil and is_player_owned(attacker)
+
+            if ahc and attacker_is_player then
+                local warrior_now = is_warrior()
+                local hstore = thread.get_hook_storage()
+                state.calc_damage_has_ctx = true
 
                 -- Arc of Obliteration: the first real player-owned hit in the opening
                 -- strike (native bank 150 / motion 2015, frame < 60) starts one 2-second buff.
-                if cfg.arc_obliteration_hit_buff and is_warrior() and attacker
-                    and is_player_owned(attacker) then
-    if state.arc_obliteration_buff_remaining > 0.0 then
-                        thread.get_hook_storage()["GSMAX_ArcObliteration_BuffDI"] = di
+                if cfg.arc_obliteration_hit_buff and warrior_now then
+                    if state.arc_obliteration_buff_remaining > 0.0 then
+                        hstore["GSMAX_ArcObliteration_BuffDI"] = di
 
                         -- HolyBrust: only the second native Arc of Obliteration hit.
                         -- Observed native second hit is ~frame 82-84; later native hit is ~95-96.
@@ -1200,7 +1244,7 @@ if damage_method then
                             local frame = safe_call(state.fullLayer, "get_Frame()") or safe_call(state.fullLayer, "get_Frame")
                             if bank == 150 and motion == 2015 and type(frame) == "number"
                                 and frame > 60.0 and frame < 90.0 then
-                                thread.get_hook_storage()["GSMAX_ArcObliteration_HolyBrustDI"] = di
+                                hstore["GSMAX_ArcObliteration_HolyBrustDI"] = di
                             end
                         end
                     elseif state.fullNode == "Job05_ArcOfObliterationEnd" and state.fullLayer
@@ -1209,7 +1253,7 @@ if damage_method then
                         local motion = safe_call(state.fullLayer, "get_MotionID()")
                         local frame = safe_call(state.fullLayer, "get_Frame()") or safe_call(state.fullLayer, "get_Frame")
                         if bank == 150 and motion == 2015 and type(frame) == "number" and frame < 60.0 then
-                            thread.get_hook_storage()["GSMAX_ArcObliteration_TriggerDI"] = di
+                            hstore["GSMAX_ArcObliteration_TriggerDI"] = di
                         end
                     end
                 end
@@ -1217,12 +1261,11 @@ if damage_method then
                 -- Horizontal Slash Full: first real native hit while frame < 60 starts
                 -- a 2.4-second +20% outgoing-player damage buff. The triggering hit itself
                 -- is not boosted by this buff; subsequent native player-owned hits are.
-                if cfg.horizontal_slash_full_hit_buff and is_warrior() and attacker
-                    and is_player_owned(attacker) then
+                if cfg.horizontal_slash_full_hit_buff and warrior_now then
                     if state.horizontal_slash_full_buff_remaining > 0.0 then
                         -- Diagnostic: capture actual native action on each hit while buff is live.
                         -- No effects or damage logic are changed by this instrumentation.
-                        thread.get_hook_storage()["GSMAX_HorizontalSlashFull_BuffDI"] = di
+                        hstore["GSMAX_HorizontalSlashFull_BuffDI"] = di
 
                         -- First hit (<60) starts the buff; HolyBrust EFX/sound belong to
                         -- the second native hit, i.e. the later phase at frame >= 60.
@@ -1230,7 +1273,7 @@ if damage_method then
                             and not state.horizontal_slash_full_effect_latched then
                             local frame = safe_call(state.fullLayer, "get_Frame()") or safe_call(state.fullLayer, "get_Frame")
                             if type(frame) == "number" and frame >= 60.0 then
-                                thread.get_hook_storage()["GSMAX_HorizontalSlashFull_EffectDI"] = di
+                                hstore["GSMAX_HorizontalSlashFull_EffectDI"] = di
                             end
                         end
                         -- DLC EX uses one native motion (150/1205) for both follow-up hits.
@@ -1241,9 +1284,9 @@ if damage_method then
                             local frame = safe_call(state.fullLayer, "get_Frame()")
                             if bank == 150 and motion == 1205 and type(frame) == "number" then
                                 if frame < 45.0 and not state.horizontal_slash_full_effect_latched then
-                                    thread.get_hook_storage()["GSMAX_HorizontalSlashFull_EffectDI"] = di
+                                    hstore["GSMAX_HorizontalSlashFull_EffectDI"] = di
                                 elseif frame >= 45.0 and not state.horizontal_slash_ex_third_effect_latched then
-                                    thread.get_hook_storage()["GSMAX_HorizontalSlashEX_ThirdDI"] = di
+                                    hstore["GSMAX_HorizontalSlashEX_ThirdDI"] = di
                                 end
                             end
                         end
@@ -1251,7 +1294,7 @@ if damage_method then
                         and not state.horizontal_slash_full_trigger_latched then
                         local frame = safe_call(state.fullLayer, "get_Frame()") or safe_call(state.fullLayer, "get_Frame")
                         if type(frame) == "number" and frame < 60.0 then
-                            thread.get_hook_storage()["GSMAX_HorizontalSlashFull_TriggerDI"] = di
+                            hstore["GSMAX_HorizontalSlashFull_TriggerDI"] = di
                         end
                     end
                 end
@@ -1260,29 +1303,25 @@ if damage_method then
                 -- The player's confirmed weapon ability 21 is required.
                 -- Capture the native body animation frame at hit calculation time.
                 if gsmax_ex and gsmax_ex.heavy_running_thrust_ex
-                    and is_warrior() and attacker and is_player_owned(attacker)
+                    and warrior_now
                     and state.fullNode == "Job05_HeavyRunningThrustFinishEx"
                     and state.fullLayer then
                     local frame = safe_call(state.fullLayer, "get_Frame()")
                     if type(frame) == "number" and frame >= 60.0 and frame <= 90.0 then
-                        thread.get_hook_storage()["GSMAX_ThrustEX_FinishDI"] = di
+                        hstore["GSMAX_ThrustEX_FinishDI"] = di
                     end
                 end
 
                 -- Only player-owned outgoing hits can receive the chain multiplier.
-                if cfg.light_attack_chain and is_warrior() and attacker
-                    and is_player_owned(attacker) and general_nodes[state.fullNode] then
-                    thread.get_hook_storage()["GSMAX_LightChain_DamageInfo"] = di
+                if cfg.light_attack_chain and warrior_now and general_nodes[state.fullNode] then
+                    hstore["GSMAX_LightChain_DamageInfo"] = di
                 end
 
                 if cfg.arcroar_damage_buff
                     and state.arcroar_buff_active
-                    and state.arcroar_buff_remaining > 0.0
-                    and attacker
-                    and is_player_owned(attacker) then
+                    and state.arcroar_buff_remaining > 0.0 then
                     state.arcroar_damage_pending = true
-                    thread.get_hook_storage()["GSMAX_ArcRoar_DamageInfo"] = di
-
+                    hstore["GSMAX_ArcRoar_DamageInfo"] = di
                 end
             end
 
@@ -1291,21 +1330,20 @@ if damage_method then
             -- apply the stamina penalty after native damage calculation.
             local dhc = safe_get(di, "<DamageHitController>k__BackingField")
             local receiver = dhc and safe_get(dhc, "<CachedCharacter>k__BackingField")
-            if cfg.damage_stamina_debuff and receiver and is_player_owned(receiver) then
+            local receiver_is_player = receiver ~= nil and is_player_owned(receiver)
+            if cfg.damage_stamina_debuff and receiver_is_player then
                 refresh_player()
                 if is_warrior() then
+                    state.calc_damage_has_ctx = true
                     thread.get_hook_storage()["GSMAX_Warrior_IncomingDamageDI"] = di
                 end
             end
 
             -- Existing Tidal Wrath receiver/attacker inspection.
             if not cfg.tidal_wrath or not counter_nodes[state.fullNode] then return end
-            if not receiver or not is_player_owned(receiver) then return end
+            if not receiver_is_player then return end
             if not ahc then return end
 
-            local shell = safe_get(ahc, "<CachedShell>k__BackingField")
-            local attacker = shell and safe_get(shell, "<OwnerCharacter>k__BackingField")
-                or safe_get(ahc, "<CachedCharacter>k__BackingField")
             if attacker then
                 local boss = safe_call(attacker, "get_IsBoss()")
                 local go = safe_call(attacker, "get_GameObject()")
@@ -1317,10 +1355,17 @@ if damage_method then
             end
         end,
         function(retval)
+            if not state.calc_damage_has_ctx and not state.arcroar_damage_pending then
+                return retval
+            end
+            state.calc_damage_has_ctx = false
+            local post_storage = thread.get_hook_storage()
+
             -- Weaponlord-style: native calcDamageValue has populated DamageInfo.Damage.
             if state.arcroar_damage_pending then
                 state.arcroar_damage_pending = false
-                local di = thread.get_hook_storage()["GSMAX_ArcRoar_DamageInfo"]
+                local di = post_storage and post_storage["GSMAX_ArcRoar_DamageInfo"] or nil
+                if post_storage then post_storage["GSMAX_ArcRoar_DamageInfo"] = nil end
                 if di then
                     local damage = safe_get(di, "Damage")
                     if type(damage) == "number" and damage > 0.0 then
@@ -1336,8 +1381,8 @@ if damage_method then
             -- so zero/non-damaging collision checks cannot start the buff. The triggering hit
             -- itself is not boosted; the 1.20 multiplier applies to subsequent outgoing hits.
 
-            local arcobl_trigger_di = thread.get_hook_storage()["GSMAX_ArcObliteration_TriggerDI"]
-            thread.get_hook_storage()["GSMAX_ArcObliteration_TriggerDI"] = nil
+            local arcobl_trigger_di = post_storage and post_storage["GSMAX_ArcObliteration_TriggerDI"] or nil
+            if post_storage then post_storage["GSMAX_ArcObliteration_TriggerDI"] = nil end
             if arcobl_trigger_di and not state.arc_obliteration_trigger_latched then
                 local damage = safe_get(arcobl_trigger_di, "Damage")
                 if type(damage) == "number" and damage > 0.0 then
@@ -1348,8 +1393,8 @@ if damage_method then
 
             -- Horizontal Slash Full first-hit trigger. Require actual positive native damage.
             -- This hit starts the buff only; EFX/sound are reserved for the second hit.
-            local hslash_trigger_di = thread.get_hook_storage()["GSMAX_HorizontalSlashFull_TriggerDI"]
-            thread.get_hook_storage()["GSMAX_HorizontalSlashFull_TriggerDI"] = nil
+            local hslash_trigger_di = post_storage and post_storage["GSMAX_HorizontalSlashFull_TriggerDI"] or nil
+            if post_storage then post_storage["GSMAX_HorizontalSlashFull_TriggerDI"] = nil end
             if hslash_trigger_di and not state.horizontal_slash_full_trigger_latched then
                 local damage = safe_get(hslash_trigger_di, "Damage")
                 if type(damage) == "number" and damage > 0.0 then
@@ -1362,7 +1407,6 @@ if damage_method then
             -- Capture all remaining hook-storage values before spawning EFX. requestEffect can
             -- synchronously re-enter game code/hooks, so hook storage must not be queried again
             -- after play_holybrust_standalone() returns.
-            local post_storage = thread.get_hook_storage()
             local holybrust_di = post_storage and post_storage["GSMAX_ArcObliteration_HolyBrustDI"] or nil
             local arcobl_buff_di = post_storage and post_storage["GSMAX_ArcObliteration_BuffDI"] or nil
             local chain_di = post_storage and post_storage["GSMAX_LightChain_DamageInfo"] or nil
@@ -1508,19 +1552,24 @@ local function is_skillmaker_arcroar_buff_active()
     return false
 end
 
-local function update_arcroar_vfx2_trigger()
+local function update_arcroar_vfx2_trigger(frame)
     if not cfg.arcroar_damage_buff or not is_warrior() or not state.fullLayer then
         state.arcroar_vfx2_trigger_latched=false
         return
     end
-    local frame=safe_call(state.fullLayer,"get_Frame()") or safe_call(state.fullLayer,"get_Frame")
+    if not is_skillmaker_arcroar_buff_active() then
+        state.arcroar_vfx2_trigger_latched=false
+        return
+    end
+    frame = frame or safe_call(state.fullLayer,"get_Frame()") or safe_call(state.fullLayer,"get_Frame")
+    if type(frame)~="number" or frame<170.0 or frame>175.0 then
+        state.arcroar_vfx2_trigger_latched=false
+        return
+    end
     local mot=safe_call(state.fullLayer,"get_HighestWeightMotionNode()") or safe_call(state.fullLayer,"get_HighestWeightMotionNode")
     local anim=mot and (safe_call(mot,"get_MotionName()") or safe_call(mot,"get_MotionName")) or ""
-    local arcroar_skill_active = is_skillmaker_arcroar_buff_active()
-    local ready=arcroar_skill_active
-        and type(anim)=="string"
+    local ready=type(anim)=="string"
         and anim:find("atk_custom_warcry_for_selfbuff",1,true)~=nil
-        and type(frame)=="number" and frame>=170.0 and frame<=175.0
     if ready and not state.arcroar_vfx2_trigger_latched then
         state.arcroar_vfx2_trigger_latched=true
         start_arcroar_buff()
@@ -1633,12 +1682,17 @@ local function gsmax_ex_update()
 end
 
 re.on_application_entry("LateUpdateBehavior", function()
+    state.frame_id = (state.frame_id or 0) + 1
+    local frame_delta = nil
     if state.damage_stamina_cooldown_remaining > 0.0 then
+        frame_delta = get_game_delta()
         state.damage_stamina_cooldown_remaining = math.max(0.0,
-            state.damage_stamina_cooldown_remaining - get_game_delta())
+            state.damage_stamina_cooldown_remaining - frame_delta)
     end
     if not refresh_player() or not is_warrior() then return end
     gsmax_ex_update()
+    local frame = state.fullLayer and (safe_call(state.fullLayer, "get_Frame()") or safe_call(state.fullLayer, "get_Frame")) or nil
+
     -- Skill Maker public bridge: fire the validated B VFX + sound once at
     -- activation (skill time 0.0), independently for each named skill.
     -- ActiveSkills is refreshed by Skill Maker each frame; storage identity
@@ -1669,7 +1723,6 @@ re.on_application_entry("LateUpdateBehavior", function()
     -- sampled frame may belong to the previous action. Never fire on that sample.
     -- Never re-arm on a frame rewind: a finish action gets at most one B.
     if state.fullNode == "Job05_HeavyRunningThrustFinishEx" and state.fullLayer then
-        local frame = safe_call(state.fullLayer, "get_Frame()")
         if type(frame) == "number" then
             local prev = state.thrust_ex_impact_b_last_frame
             -- Frame <=30 is used only to establish that the new finish motion
@@ -1703,17 +1756,15 @@ re.on_application_entry("LateUpdateBehavior", function()
         state.thrust_ex_sound75_latched = false
         state.thrust_ex_impact_b_armed = false
         state.thrust_ex_impact_b_last_frame = nil
-    end
-    -- Re-arm the one-shot HolyBrust when the native finish action ends.
-    if state.fullNode ~= "Job05_HeavyRunningThrustFinishEx" then
         state.thrust_ex_holybrust_latched = false
     end
     if not state.params_set then set_params() end
-    update_arcroar_vfx2_trigger()
+    update_arcroar_vfx2_trigger(frame)
 
     if state.arcroar_buff_active then
         update_arcroar_vfx_follow()
-        state.arcroar_buff_remaining = state.arcroar_buff_remaining - get_game_delta()
+        frame_delta = frame_delta or get_game_delta()
+        state.arcroar_buff_remaining = state.arcroar_buff_remaining - frame_delta
         if state.arcroar_buff_remaining <= 0.0 then
             state.arcroar_buff_remaining = 0.0
             state.arcroar_buff_active = false
@@ -1726,17 +1777,17 @@ re.on_application_entry("LateUpdateBehavior", function()
         -- shell on Spine_1 fixes the end flash at its source instead of only
         -- trying to move EffectPlayer GameObjects after creation.
         update_arcroar_vfx_follow()
-        state.arcroar_vfx_watch_remaining=math.max(0.0,state.arcroar_vfx_watch_remaining-get_game_delta())
+        frame_delta = frame_delta or get_game_delta()
+        state.arcroar_vfx_watch_remaining=math.max(0.0,state.arcroar_vfx_watch_remaining-frame_delta)
         if state.arcroar_vfx_watch_remaining<=0.0 then
             state.arcroar_vfx_req_id=nil
             state.arcroar_vfx_shell=nil
             state.arcroar_vfx_xform=nil
             state.arcroar_vfx_efx2=nil
             state.arcroar_vfx_seen={}
+            state.arcroar_vfx_last_tick=nil
         end
     end
-
-    local frame = state.fullLayer and (safe_call(state.fullLayer, "get_Frame()") or safe_call(state.fullLayer, "get_Frame")) or nil
 
     -- Full skill plays both gold hits; OneHit skill plays ONLY the second gold hit.
     -- Same public ActiveSkills bridge used for other GS_MAX skills above.
@@ -1756,11 +1807,19 @@ re.on_application_entry("LateUpdateBehavior", function()
     local arc_onehit_enabled = arc_onehit_active ~= nil and arc_onehit_active ~= false
     local arc_ultimax_enabled = arc_full_enabled or arc_onehit_enabled
 
+    local layer_bank, layer_motion = nil, nil
+    local function get_layer_bank_motion()
+        if layer_bank == nil and state.fullLayer then
+            layer_bank = safe_call(state.fullLayer, "get_MotionBankID()") or false
+            layer_motion = safe_call(state.fullLayer, "get_MotionID()") or false
+        end
+        return layer_bank, layer_motion
+    end
+
     -- Preserve native motion/frame triggers and miss-independent behavior,
     -- with first gold gated to full skill only and second gold to either skill.
     if arc_ultimax_enabled and state.fullNode == "Job05_ArcOfObliterationEnd" and state.fullLayer then
-        local arc_bank = safe_call(state.fullLayer, "get_MotionBankID()")
-        local arc_motion = safe_call(state.fullLayer, "get_MotionID()")
+        local arc_bank, arc_motion = get_layer_bank_motion()
         if arc_bank == 150 and arc_motion == 2015 and type(frame) == "number" then
             if arc_full_enabled and frame >= ARC_GOLD1_FRAME and frame < 60.0 and not state.arc_gold_first_latched then
                 state.arc_gold_first_latched = true
@@ -1780,8 +1839,9 @@ re.on_application_entry("LateUpdateBehavior", function()
     end
 
     if state.arc_obliteration_buff_remaining > 0.0 then
+        frame_delta = frame_delta or get_game_delta()
         state.arc_obliteration_buff_remaining = math.max(0.0,
-            state.arc_obliteration_buff_remaining - get_game_delta())
+            state.arc_obliteration_buff_remaining - frame_delta)
     end
 
     if state.horizontal_slash_full_buff_remaining > 0.0 then
@@ -1796,8 +1856,9 @@ re.on_application_entry("LateUpdateBehavior", function()
             state.horizontal_slash_ex_combo_entered = false
         end
         if state.horizontal_slash_full_buff_remaining > 0.0 then
+            frame_delta = frame_delta or get_game_delta()
             state.horizontal_slash_full_buff_remaining = math.max(0.0,
-                state.horizontal_slash_full_buff_remaining - get_game_delta())
+                state.horizontal_slash_full_buff_remaining - frame_delta)
         end
     else
         state.horizontal_slash_ex_combo_entered = false
@@ -1817,9 +1878,9 @@ re.on_application_entry("LateUpdateBehavior", function()
     end
 
     -- Re-arm gold if native motion exits (including same-node transitions).
-    if state.fullNode == "Job05_ArcOfObliterationEnd" and state.fullLayer then
-        local ab = safe_call(state.fullLayer, "get_MotionBankID()")
-        local am = safe_call(state.fullLayer, "get_MotionID()")
+    if (state.arc_gold_first_latched or state.arc_gold_second_latched)
+        and state.fullNode == "Job05_ArcOfObliterationEnd" and state.fullLayer then
+        local ab, am = get_layer_bank_motion()
         if ab ~= 150 or am ~= 2015 then
             state.arc_gold_first_latched = false
             state.arc_gold_second_latched = false
@@ -1827,17 +1888,10 @@ re.on_application_entry("LateUpdateBehavior", function()
     end
 
     -- Re-arm only after leaving the native Arc of Obliteration end motion.
-    if state.arc_obliteration_trigger_latched then
-        local bank = state.fullLayer and safe_call(state.fullLayer, "get_MotionBankID()") or nil
-        local motion = state.fullLayer and safe_call(state.fullLayer, "get_MotionID()") or nil
+    if state.arc_obliteration_trigger_latched or state.arc_obliteration_holybrust_latched then
+        local bank, motion = get_layer_bank_motion()
         if state.fullNode ~= "Job05_ArcOfObliterationEnd" or bank ~= 150 or motion ~= 2015 then
             state.arc_obliteration_trigger_latched = false
-            state.arc_obliteration_holybrust_latched = false
-        end
-    elseif state.arc_obliteration_holybrust_latched then
-        local bank = state.fullLayer and safe_call(state.fullLayer, "get_MotionBankID()") or nil
-        local motion = state.fullLayer and safe_call(state.fullLayer, "get_MotionID()") or nil
-        if state.fullNode ~= "Job05_ArcOfObliterationEnd" or bank ~= 150 or motion ~= 2015 then
             state.arc_obliteration_holybrust_latched = false
         end
     end
@@ -1846,8 +1900,7 @@ re.on_application_entry("LateUpdateBehavior", function()
     -- Natural transitions get first priority. Only repair a 1301 state that
     -- persists beyond frame 3 after this charge has passed through 1300.
     if cfg.indomitable_lash and state.fullLayer and state.skillState == 58 then
-        local bank = safe_call(state.fullLayer, "get_MotionBankID()")
-        local motion = safe_call(state.fullLayer, "get_MotionID()")
+        local bank, motion = get_layer_bank_motion()
 
         if bank == 150 and motion == 1300 then
             state.il1302_seen_1300 = true
