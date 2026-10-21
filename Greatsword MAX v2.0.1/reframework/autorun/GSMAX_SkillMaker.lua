@@ -1663,6 +1663,11 @@ local function update_skill(skill_tbl, idx, enemy_name)
 	for i, smnode in ipairs(skill_tbl.smnodes) do 
 		smnode.action_idx = func.find_key(act_names, smnode.action_name) or smnode.action_idx --update old nodes
 		smnode.udata_idx = func.find_key(user_paths, smnode.udata_name) or smnode.udata_idx --update old user files
+		if smnode.udata_idx and smnode.udata_idx > 1 and smnode.is_decorative and not smnode.do_vfx and not smnode.do_sfx then
+			smnode.udata_idx = 1
+			smnode.udata_name = "None"
+			smnode.is_decorative = false
+		end
 		
 		if smnode.do_simplify_action == nil then smnode.do_simplify_action = true end
 		if smnode.skyfall_cam_relative == nil then smnode.skyfall_cam_relative = false end
@@ -3071,7 +3076,11 @@ local function change_efx2_color(efx2, nstore, color_tbl, shell_inst)
 			walk_tick = ticks
 			for i, c_effect_data in pairs(efx2.CreatedEffectDataList._items) do
 				if not c_effect_data then break end
-				for c, c_effect in pairs(func.lua_get_array(c_effect_data.list._items)) do
+				local ce_list = c_effect_data.list
+				local ce_items = ce_list and ce_list._items
+				local ce_count = (ce_list and ce_list._size) or (ce_items and #ce_items) or 0
+				for c = 0, ce_count - 1 do
+					local c_effect = ce_items and ce_items[c]
 					if not c_effect then break end
 					--'seen once' is recorded separately from the tracked player list below: the list is
 					--only ever filled inside the shorthand guard further down, so on a build where that
@@ -3180,22 +3189,33 @@ local function change_shell_udata(base, smnode, cast_id, skill_name, udata_path)
             restore_pending.last_id = cast_id
             restore_pending.count = restore_pending.count + 1
         end
-        -- Retain the exact v1.6 clone/add_ref diagnostic before any writes.
-        local ok_clone, clone_or_err = pcall(function()
-            if base == nil then error("ShellBaseParam is nil") end
-            return base:MemberwiseClone()
-        end)
-        if not ok_clone or clone_or_err == nil then
-            return true
-        end
-        local ok_ref, ref_or_err = pcall(function() return clone_or_err:add_ref() end)
-        if not ok_ref or ref_or_err == nil then
-            return true
+        if base == nil then return true end
+        gsmx_diag.v20_orig_snap = gsmx_diag.v20_orig_snap or {}
+        local snap = gsmx_diag.v20_orig_snap[base_key]
+        if not snap or snap._base ~= base then
+            local ok_snap, new_snap = pcall(function()
+                local sc = base.Scale
+                return {
+                    _base = base,
+                    UseScale = base.UseScale,
+                    Scale = sc and Vector3f.new(sc.x, sc.y, sc.z) or Vector3f.new(1.0, 1.0, 1.0),
+                    UseLifeTime = base.UseLifeTime,
+                    LifeTime = base.LifeTime,
+                    UseOmenPhase = base.UseOmenPhase,
+                    OmenTime = base.OmenTime,
+                    UseSetLand = base.UseSetLand,
+                }
+            end)
+            if not ok_snap or not new_snap then
+                return true
+            end
+            snap = new_snap
+            gsmx_diag.v20_orig_snap[base_key] = snap
         end
         -- Arm only on the first cast while this base is pending. Preserve its
         -- pre-write snapshot; overlapping casts extend the same deadline.
         if not restore_pending and not gsmx_diag.v20_restore_disabled[base_key] then
-            restore_pending = {base=base, original=ref_or_err, start=game_time,
+            restore_pending = {base=base, original=snap, start=game_time,
                 deadline=game_time+0.1, first_id=cast_id, last_id=cast_id,
                 count=1, skill=skill_name, node=node_idx, path=udata_path}
             gsmx_diag.v20_pending[base_key] = restore_pending
@@ -5799,18 +5819,43 @@ local function nearest_enemy_fn(compare_pos, extra_fn, do_add_player, owner, do_
 	local closest_pos
 	local closest_em
 	local is_pl_side = (owner == player or sm_summons[owner])
+	if is_pl_side and not do_add_player then
+		local list = em_mgr and em_mgr._EnemyList
+		local items = list and list._items
+		local count = (list and list._size) or (items and #items) or 0
+		for idx = 0, count - 1 do
+			local enemy = items and items[idx]
+			local chara = enemy and enemy._Chara
+			if chara then
+				local xform = chara["<Transform>k__BackingField"]
+				local em_pos = xform and xform:get_Position()
+				local this_dist = em_pos and (em_pos - compare_pos):length()
+				if this_dist and this_dist < dist and (not extra_fn or extra_fn(this_dist)) then
+					local hit = chara["<Hit>k__BackingField"]
+					local hp = hit and hit:get_Hp() or 0
+					local dead_ready = do_necro == 1 or (do_necro and hp <= 0) or (not do_necro and hp > 0)
+					if dead_ready then
+						dist, closest_pos, closest_em = this_dist, em_pos, chara
+					end
+				end
+			end
+		end
+		return closest_pos, closest_em
+	end
 	local targ_list = is_pl_side and func.lua_get_array(em_mgr._EnemyList._items, true) or func.lua_get_array(owner:get_HateSystem()._Ranking, true)
 	if do_add_player then table.insert(targ_list, 1, owner) end
 	
 	for i, enemy in ipairs(targ_list) do
 		local chara = enemy._Chara or (enemy.get_TargetCharacter and enemy:get_TargetCharacter())
 		if chara then
-			local em_pos = (chara.Hip or chara["<Transform>k__BackingField"]):get_Position()
+			local em_pos = chara["<Transform>k__BackingField"]:get_Position()
 			local this_dist = (em_pos - compare_pos):length()
-			local hp = chara["<Hit>k__BackingField"]:get_Hp()
-			local dead_ready = do_necro == 1 or (do_necro and hp <= 0) or (not do_necro and hp > 0)
-			if ((do_add_player and i == 1) or dead_ready) and this_dist < dist and (not extra_fn or extra_fn(this_dist)) then
-				dist, closest_pos, closest_em = this_dist, em_pos, chara
+			if this_dist < dist and (not extra_fn or extra_fn(this_dist)) then
+				local hp = chara["<Hit>k__BackingField"]:get_Hp()
+				local dead_ready = do_necro == 1 or (do_necro and hp <= 0) or (not do_necro and hp > 0)
+				if (do_add_player and i == 1) or dead_ready then
+					dist, closest_pos, closest_em = this_dist, em_pos, chara
+				end
 			end
 		end
 	end
@@ -6929,17 +6974,19 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 				local stopped_fn = false
 				local is_holding = false 
 				
-				if owner == player then
+				if owner == player and not nstore then
 					local prev_shell = storage[s-1] and parsed_smnodes[s-1] --
-					local this_act_name = prev_shell and own_mfsm2:getCurrentNodeName(prev_shell.layer_idx); this_act_name = this_act_name and this_act_name:match(".+%.(.+)")
-					local is_prep = prev_shell and prev_shell.do_true_hold and this_act_name and (this_act_name:find("Prepare"))
-					local is_hold = prev_shell and prev_shell.do_hold and (is_prep or hk.check_hotkey("Modifier / Inhibit", true))
-					local same_node = prev_shell and (prev_shell.action_name == this_act_name or prev_shell.action_name:gsub("Prepare", "Ready") == this_act_name)		
-					if is_hold and (same_node or is_prep) and game_time - storage.start >= smnode.start then
-						hold_start = hold_start or game_time
-						storage.start = storage.og_start + (game_time - hold_start)
+					if prev_shell and (prev_shell.do_hold or prev_shell.do_true_hold) then
+						local this_act_name = own_mfsm2:getCurrentNodeName(prev_shell.layer_idx); this_act_name = this_act_name and this_act_name:match(".+%.(.+)")
+						local is_prep = prev_shell.do_true_hold and this_act_name and (this_act_name:find("Prepare"))
+						local is_hold = prev_shell.do_hold and (is_prep or hk.check_hotkey("Modifier / Inhibit", true))
+						local same_node = (prev_shell.action_name == this_act_name or prev_shell.action_name:gsub("Prepare", "Ready") == this_act_name)		
+						if is_hold and (same_node or is_prep) and game_time - storage.start >= smnode.start then
+							hold_start = hold_start or game_time
+							storage.start = storage.og_start + (game_time - hold_start)
+						end
+						is_holding = is_hold and same_node
 					end
-					is_holding = is_hold and same_node
 				end
 				
 				if pressed_cancel then
@@ -6953,10 +7000,11 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 						do_inhibit_all_buttons = smnode.do_inhibit_buttons
 					end
 					hold_start = nil
+					local needs_node_ray = ((smnode.udata_idx > 1 or smnode.summon_idx > 1) and (smnode.cast_type <= 2 or smnode.rot_type_idx == 3 or (smnode.do_aim_up_down and smnode.enemy_soft_lock))) or smnode.pl_velocity_type == 3
 					storage[s] = {
 						idx = s,
 						start = game_time, 
-						ray = (smnode.freeze_crosshair and storage[s-1] and storage[s-1].ray) or get_this_ray_result(),
+						ray = (smnode.freeze_crosshair and storage[s-1] and storage[s-1].ray) or (needs_node_ray and get_this_ray_result()) or ray_result,
 						smnode = smnode,
 						skill = skill_tbl,
 						pstore = storage[s-1], 
@@ -7186,7 +7234,7 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 									end
 									nstore.pl_soft_lock_pos = (storage.sm_store and storage.sm_store.command_coords) or nstore.pl_soft_lock_pos
 								else
-									nstore.pl_soft_lock_pos, nstore.pl_soft_lock_enemy = nearest_enemy_fn((owner.Hip or owner_xform):get_Position() + rotate_yaw_method:call(nil, cam_matrix[2] * 3.0, owner:get_Input():get_AngleRadL() + math.pi), function(this_dist)
+									nstore.pl_soft_lock_pos, nstore.pl_soft_lock_enemy = nearest_enemy_fn(owner_xform:get_Position() + rotate_yaw_method:call(nil, cam_matrix[2] * 3.0, owner:get_Input():get_AngleRadL() + math.pi), function(this_dist)
 										return this_dist < (active_states.Airborne and 10.0 or 5.0)
 									end, nil, owner)
 								end
@@ -7449,11 +7497,6 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 					end
 					
 					if smnode.udata_idx > 1 and casted_spells[i] then
-						local stam_mgr = owner:get_StaminaManager()
-						if not storage.subbed_stamina and stam_mgr and not is_enemy then
-							storage.subbed_stamina = true
-							stam_mgr["<RemainingAmount>k__BackingField"] = stam_mgr["<RemainingAmount>k__BackingField"] - skill_tbl.stam_cost
-						end
 						nstore.req_id = cast_shell(smnode, nstore, owner) --fire the shell
 					end
 					
@@ -7586,7 +7629,7 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 							stopped_fn = true
 						end
 						died = nstore.num_living_children == 0 and (died and 1 or true) or false
-						if died == 1 and (not spell_alive or (stopped_fn and #storage > s)) then
+						if died == 1 and (not spell_alive or ((not lua_fn or stopped_fn) and (#storage > s or smnode.pl_velocity_type <= 1))) then
 							pre_fns[nstore] = nil
 							nstore.finished = true
 							return
@@ -7600,7 +7643,7 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 							local xform = nstore.final_instance:get_GameObject():get_Transform()
 							nstore.instance_pos = xform:get_Position()
 							nstore.instance_rot = xform:get_Rotation()
-							nstore.hit_substance = nstore.final_instance.HitSubstance or nstore.final_instance["<TerrainHitResult>k__BackingField"]
+							nstore.hit_substance = nstore.final_instance["<TerrainHitResult>k__BackingField"]
 						end
 						
 						nstore.instance_pos = nstore.summon_pos or nstore.instance_pos --sm_summons just override shells
@@ -7680,6 +7723,14 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 						sm32.note("node manager raised on activation")
 						sm32.dbg("node", "manager raised for node "..tostring(s).." of skill "..tostring(skill_tbl.name)..": "..tostring(mgr_err))
 					end
+					if skill_tbl.stam_cost ~= 0 and not storage.subbed_stamina and casted_spells[i] and not stopped_fn and not is_enemy
+						and ((has_action and smnode.action_name ~= "DrawWeapon") or smnode.udata_idx > 1 or s == #parsed_smnodes) then
+						local stam_mgr = owner:get_StaminaManager()
+						if stam_mgr then
+							storage.subbed_stamina = true
+							stam_mgr["<RemainingAmount>k__BackingField"] = stam_mgr["<RemainingAmount>k__BackingField"] - skill_tbl.stam_cost
+						end
+					end
 					
 					--Action is executed after the custom function has had a chance to run once.
 					--The request is not conditional on the behaviour tree having handed back a node
@@ -7730,23 +7781,25 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 							local rot_euler = nstore.rot:to_euler()
 							local add_param_ids = {}
 							nstore.add_param_ids = add_param_ids
+							local next_needs_child_shells = parsed_smnodes[s+1] and parsed_smnodes[s+1].cast_type == 4
 							
-							
-							--Find child shells
-							for a, aparam in pairs(nstore.sparam._ShellAdditionalParameter._items) do
-								table.insert(add_param_ids, aparam._ShellParamIDHash)
-								local arr = aparam._ShellGeneratorConditionInfos or aparam._ShellGeneratorTimerInfos or aparam._GenerationDatas
-								arr = arr and (arr._items or arr)
-								
-								for e, element in pairs(arr or {}) do
-									local hash_obj = (element._ShellParamIDHash or aparam._ShellParamIDHash)
-									local hash = element._ShellIDHash or ((hash_obj and hash_obj._HasValue and hash_obj._Value)  or nil) or nil
-									table.insert(add_param_ids, hash)
-									local aparam_idx = func.find_key(nstore.udata.ShellParams._items, hash, "_ShellParamIdHash")
-									if aparam_idx then 
-										local aparam2 = nstore.udata.ShellParams._items[aparam_idx]
-										local base = aparam2._ShellParameterBase.ShellBaseParam
-										change_shell_udata(base, smnode, nstore.gsmx_cast_id, skill_tbl.name, user_paths[smnode.udata_idx])
+							--Find child shells only when the next node actually chains from this shell (cast_type == 4)
+							if next_needs_child_shells then
+								for a, aparam in pairs(nstore.sparam._ShellAdditionalParameter._items) do
+									table.insert(add_param_ids, aparam._ShellParamIDHash)
+									local arr = aparam._ShellGeneratorConditionInfos or aparam._ShellGeneratorTimerInfos or aparam._GenerationDatas
+									arr = arr and (arr._items or arr)
+									
+									for e, element in pairs(arr or {}) do
+										local hash_obj = (element._ShellParamIDHash or aparam._ShellParamIDHash)
+										local hash = element._ShellIDHash or ((hash_obj and hash_obj._HasValue and hash_obj._Value)  or nil) or nil
+										table.insert(add_param_ids, hash)
+										local aparam_idx = func.find_key(nstore.udata.ShellParams._items, hash, "_ShellParamIdHash")
+										if aparam_idx then 
+											local aparam2 = nstore.udata.ShellParams._items[aparam_idx]
+											local base = aparam2._ShellParameterBase.ShellBaseParam
+											change_shell_udata(base, smnode, nstore.gsmx_cast_id, skill_tbl.name, user_paths[smnode.udata_idx])
+										end
 									end
 								end
 							end
@@ -7797,21 +7850,29 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 							end
 							
 							local attached_only_once = false
-							local cant_search_children = false
+							local cant_search_children = not next_needs_child_shells
 							local shell_pos
+							local max_shell_age = (smnode.lifetime >= 0 and (smnode.do_abs_lifetime and smnode.lifetime or (smnode.lifetime + 0.5))) or nil
 							
 							--manage the current shell's speed and damage every frame
 							temp_fns[shell_inst] = function() 
-								if not shell_inst:get_Valid() or (game_time - storage.start > sms.shell_lifetime_limit) or (storage.did_replace_em and (not owner:get_Valid() or owner:get_Hp() <= 0))
+								local force_kill = (storage.did_replace_em and (not owner:get_Valid() or owner:get_Hp() <= 0))
+									or (smnode.do_abs_lifetime and smnode.lifetime >= 0 and game_time - nstore.start > smnode.lifetime)
+									or (smnode.lifetime == -2.0 and (#storage > s+1))
+								if not shell_inst:get_Valid() or not gameobj:get_UpdateSelf() or (game_time - storage.start > sms.shell_lifetime_limit)
 								--'-1' means "leave the shell's own lifetime alone", so it is not a duration to compare
 								--against: 'elapsed > -1' is true on the first call, and the first call happens the moment
 								--this manager is installed, which destroyed the shell as soon as it appeared.  The
 								--'Abs. Lifetime' switch is only drawn while a real lifetime is set, so a node that had one
 								--and then went back to the sentinel could carry the flag into exactly that state.
-								or (smnode.do_abs_lifetime and smnode.lifetime >= 0 and game_time - nstore.start > smnode.lifetime) or (smnode.lifetime == -2.0 and (#storage > s+1)) then
+								or force_kill or (max_shell_age and game_time - nstore.start > max_shell_age) then
 									temp_fns[shell_inst] = nil
 									active_shells[shell_inst] = nil
 									if efx2 then temp_fns[efx2] = nil end
+									if force_kill and shell_inst:get_Valid() then
+										gameobj:destroy(gameobj)
+									end
+									return
 								else
 									nstore.num_living_children = nstore.num_living_children + 1
 								end
@@ -7823,7 +7884,7 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 									work_rate.NextRateValue = smnode.speed
 									work_rate.NextApplyRate = smnode.speed
 									
-									if not nstore.children[1] then
+									if not cant_search_children and not nstore.children[1] and #add_param_ids > 0 then
 										for i, child in pairs(func.get_children(xform) or {}) do
 											local child_shell = func.getC(child:get_GameObject(), "app.Shell")
 											if child_shell and not temp_fns[child_shell] and child_shell["<RequestId>k__BackingField"] > nstore.req_id and (s == #storage or (storage[s+1] and storage[s+1].cast_type ~= 4)) then 
@@ -7883,7 +7944,7 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 										end
 									end
 									
-									if not cant_search_children then
+									if not cant_search_children and #add_param_ids > 0 then
 										--This used to copy the game's whole shell list and then read a member
 										--off every entry in it, once for each parameter id it was looking
 										--for - for every node, on every frame.  The list is now grouped by
@@ -7904,8 +7965,6 @@ local function cast_spell(skill_tbl_real, i, em_tbl, forced_start_time, skill_st
 											end
 										end
 									end
-								elseif shell_inst:get_Valid() then
-									gameobj:destroy(gameobj)
 								end
 							end
 							temp_fns[shell_inst]()
@@ -8058,6 +8117,9 @@ re.on_pre_application_entry("UpdateBehavior", function()
 	player = chr_mgr:get_ManualPlayer()
 	local pl_go = player and player:get_Valid() and player:get_GameObject()
 	pl_xform = pl_go and pl_go:get_Transform()
+	sm32.pl_hit = pl_xform and player["<Hit>k__BackingField"] or nil
+	local pl_stam_mgr = pl_xform and player:get_StaminaManager() or nil
+	sm32.pl_stam_mgr_addr = pl_stam_mgr and pl_stam_mgr:get_address() or nil
 	camera = sdk.get_primary_camera()
 	cam_matrix = camera and camera:get_WorldMatrix()
 	is_casting = next(casted_spells) and (is_casting or true)
@@ -8120,51 +8182,10 @@ re.on_pre_application_entry("UpdateBehavior", function()
 	is_cfg_modifier_down = hk.check_hotkey("SM Config Modifier", true)
 	do_show_crosshair = (sms.crosshair_type == 2 or (sms.crosshair_type == 3 and is_modifier_down))
 
-	--Which enabled skills actually read the crosshair from one of their functions, and when.  This
-	--is answered when the settings change rather than on every frame, and it is kept in two halves
-	--because the two halves are read at different times.
-	--
-	--An Activation Function is evaluated on every frame the skill could start on, so a function that
-	--names Crosshair needs a fresh point whether or not anything is running.  A node's Custom
-	--Function only runs while its skill is running, so a configuration whose nodes name Crosshair
-	--only needs the point while a skill is actually running.  Everything else - a node that takes
-	--its position or rotation from the crosshair, the double-click preview - asks for the point at
-	--the moment it needs it and is not part of this.
-	--
-	--That distinction is the whole of the cost: a skill whose nodes have no crosshair function used
-	--to pay for a cast on every frame it ran, purely because something was running.
 	if sm32.wants_crosshair == nil or was_changed then
-		sm32.ray_for_activate, sm32.ray_for_node = false, false
-		sm32.has_any_enemy_skill = false
-		for i, skill_tbl in ipairs(sms.skills) do
-			if skill_tbl.enabled then
-				if type(skill_tbl.activate_fn) == "string" and skill_tbl.activate_fn:find("Crosshair", 1, true) then
-					sm32.ray_for_activate = true
-				end
-				for s, smnode in ipairs(skill_tbl.smnodes or {}) do
-					if type(smnode.custom_fn) == "string" and smnode.custom_fn:find("Crosshair", 1, true) then
-						sm32.ray_for_node = true
-					end
-				end
-			end
-			if sm32.ray_for_activate and sm32.ray_for_node then break end
+		if sm32.refresh_feature_flags then
+			sm32.refresh_feature_flags()
 		end
-		--enemy skills read the point through the same names, and run without any of the player-side
-		--gates, so they are counted here too
-		for em_name, skills_list in pairs(sms.enemyskills or {}) do
-			local em_group_enabled = (type(skills_list) == "table" and skills_list.enabled)
-			for i, em_skill in pairs((type(skills_list) == "table" and skills_list.skills) or {}) do
-				if type(em_skill) == "table" and em_skill.enabled then
-					if em_group_enabled then sm32.has_any_enemy_skill = true end
-					for s, smnode in ipairs(em_skill.smnodes or {}) do
-						if type(smnode.custom_fn) == "string" and smnode.custom_fn:find("Crosshair", 1, true) then
-							sm32.ray_for_node = true
-						end
-					end
-				end
-			end
-		end
-		sm32.wants_crosshair = sm32.ray_for_activate or sm32.ray_for_node
 	end
 	sm32.prof_end("hotkeys")
 	
@@ -8536,14 +8557,16 @@ re.on_pre_application_entry("UpdateBehavior", function()
 		sm32.prof_end("node managers")
 	end
 	
-	for chr, tbl in pairs(rel_db) do
-		if not chr:get_Valid() then 
-			rel_db[chr] = nil
-		elseif math.random(1, 100) == 1 then
-			for chr2, num in pairs(tbl) do 
-				if not (sdk.is_managed_object(chr2) and chr2.get_Valid and chr2:get_Valid()) then rel_db[chr] = nil end
-			end
-		end		
+	if next(rel_db) ~= nil then
+		for chr, tbl in pairs(rel_db) do
+			if not chr:get_Valid() then 
+				rel_db[chr] = nil
+			elseif math.random(1, 100) == 1 then
+				for chr2, num in pairs(tbl) do 
+					if not (sdk.is_managed_object(chr2) and chr2.get_Valid and chr2:get_Valid()) then rel_db[chr] = nil end
+				end
+			end		
+		end
 	end
 	if math.random(1, 60) == 1 then
 		for hit, nstore in pairs(dmg_tbl) do
@@ -8636,6 +8659,11 @@ re.on_application_entry("UpdateBehavior", function()
 		local ok_tmp, tmp_err = pcall(tmp_list[tf])
 		if not ok_tmp and sm32.dbg_on then
 			sm32.dbg("node", "an update function raised: "..tostring(tmp_err))
+		end
+	end
+	if not is_paused and next(turn_fns) then
+		for _, fn in pairs(turn_fns) do
+			pcall(fn)
 		end
 	end
 	sm32.prof_end("update functions")
@@ -8774,7 +8802,7 @@ re.on_application_entry("UpdateBehavior", function()
 			
 		elseif hotkey_ready and skill_tbl.enabled and modf_ready and (not casted_spells[i] or (skill_tbl.spell_states ~= "" and skill_tbl.spell_states:find("%%"..skill_tbl.name))) then --"[^%a%c]"..skill_tbl.name.."$?[^%a]"
 			local is_correct_vocation = (skill_tbl.job_idx == 1 or curr_job == skill_tbl.job_idx - 1)
-			if not is_correct_vocation or (skill_tbl.stam_cost ~= 0 and stam_remaining <= 0) or casted_this_frame[hk.hotkeys[hk_name] ] then
+			if not is_correct_vocation or (skill_tbl.stam_cost ~= 0 and stam_remaining <= 0) or (not skill_tbl.do_auto and casted_this_frame[hk.hotkeys[hk_name] ]) then
 				goto next_skill
 			end
 
@@ -8913,7 +8941,9 @@ re.on_application_entry("UpdateBehavior", function()
 					player["<ActionManager>k__BackingField"]:requestActionCore(0, "DrawWeapon", 1)
 					goto exit
 				elseif is_correct_weapon then
-					casted_this_frame[hk.hotkeys[hk_name] ] = true
+					if not skill_tbl.do_auto then
+						casted_this_frame[hk.hotkeys[hk_name] ] = true
+					end
 					if active_states.Falling and skill_tbl.states.Falling then --reset fall on midair cast
 						reset_fall_height(3.0)
 					end
@@ -9129,7 +9159,7 @@ end)
 --of its own - a block, a barrier - needs those rules to keep running, so that skill can switch this
 --off for itself with 'Vanilla Stamina'.
 sm32.hook("app.HumanStaminaController", "Chara_OnConsumeStaminaHandler", function(args)
-    if is_casting and not sm32.vanilla_stamina and game_time - last_loco_time < 1.0 then
+	if is_casting and not sm32.vanilla_stamina and game_time - last_loco_time < 1.0 then
 		return sdk.PreHookResult.SKIP_ORIGINAL
 	end
 end)
@@ -9139,215 +9169,15 @@ end)
 -- but let positive app.StaminaManager.add amounts through during skills.
 -- Skill Maker's own Stamina Cost remains a separate one-time direct subtraction.
 sm32.hook("app.StaminaManager", "add", function(args)
-    if is_casting and not sm32.vanilla_stamina and game_time - last_loco_time < 1.0 then
-        local ok, amount = pcall(sdk.to_float, args[3])
-        -- Fail open if the argument layout changes: never suppress an unknown
-        -- call that could be the game's normal stamina recovery.
-        if ok and type(amount) == "number" and amount <= 0.0 then
-            return sdk.PreHookResult.SKIP_ORIGINAL
-        end
-    end
-end)
-
---Face buttons GUI modding:
-sm32.hook("app.ui020401", "update", 
-	function(args)
-		for name, fn in pairs(ui_fns) do
-			fn()
+	if is_casting and not sm32.vanilla_stamina and game_time - last_loco_time < 1.0 then
+		if sm32.pl_stam_mgr_addr and sdk.to_int64(args[2]) ~= sm32.pl_stam_mgr_addr then return end
+		local ok, amount = pcall(sdk.to_float, args[3])
+		-- Fail open if the argument layout changes: never suppress an unknown
+		-- call that could be the game's normal stamina recovery.
+		if ok and type(amount) == "number" and amount <= 0.0 then
+			return sdk.PreHookResult.SKIP_ORIGINAL
 		end
-	end,
-	function(retval)
-		if sms.ingame_ui_buttons and sms.modifier_inhibits_buttons and gamepad_button_guis and is_modifier_down and gamepad_button_guis.face_obj:get_DrawSelf() then
-			gamepad_button_guis.dpad_obj:set_DrawSelf(true)
-			gamepad_button_guis.dpad_obj:set_UpdateSelf(true)
-
-			local hotkey_arr = hk.buttons[sms.hotkeys["Modifier / Inhibit"] ] and gamepad_button_guis.dpad_arr or gamepad_button_guis.dpad_arr_kb
-			for j, hotkey_str in ipairs(gamepad_button_guis.dpad_arr) do
-				local hotkey = hotkey_arr[j]
-				local cfg_idx = sksets_by_hotkeys[hotkey]
-				local skill_idx = (is_modifier2_down and ((is_modifier_down and skills_by_hotkeys2[hotkey]) or (is_sws_down and skills_by_hotkeys_sws[hotkey]) or (not is_sws_down and skills_by_hotkeys_no_sws[hotkey]))) 
-					or (is_modifier_down and (((is_sws_down and skills_by_hotkeys_sws[hotkey]) or (not is_sws_down and skills_by_hotkeys_no_sws[hotkey])) or ((skills_by_hotkeys[hotkey] and not sms.skills[skills_by_hotkeys[hotkey] ].use_modifier2) and skills_by_hotkeys[hotkey])))
-					or (is_sws_down and skills_by_hotkeys_sws[hotkey]) or (not is_sws_down and skills_by_hotkeys_no_sws[hotkey])
-				local txt_obj = gamepad_button_guis[hotkey_str]
-				local txt
-				
-				if cfg_idx and sms.skillsets.idxes[cfg_idx] > 1 and (not sms.load_sksets_w_modifier or is_modifier_down) and (not sms.load_sksets_w_sksets_modifier or is_cfg_modifier_down) then
-					txt = skillsets_glob.short[sms.skillsets.idxes[cfg_idx] ]
-					txt = "["..(txt:match(".+ %- (.+)") or txt:match(".+%\\(.+)") or txt):gsub("_", " ").."]"
-				--the blank caption marks a direction the inhibitor has taken away; a direction it now
-				--spares still does its vanilla job, so leave that label alone
-				elseif (skill_idx and ((is_modifier_down and skills_by_hotkeys[hotkey]) or (is_sws_down and skills_by_hotkeys_sws[hotkey]) or (not is_sws_down and skills_by_hotkeys_no_sws[hotkey]))) or (not skill_idx and sms.modifier_inhibits_buttons and is_modifier_down and ((hk.buttons[hotkey_str] or 0) & (sm32.dpad_used_bits or -1)) ~= 0) then
-					txt = not skill_idx and " " or sms.last_sel_spells[skill_idx] ~= "" and sms.last_sel_spells[skill_idx] or "Skill "..skill_idx
-					txt = (txt:match(".+ %- (.+)") or txt:match(".+%\\(.+)") or txt):gsub("_", " ")
-				end
-				
-				if txt then
-					local panel = txt_obj:get_Parent()
-					local ok_txt, old_txt = pcall(function() return txt_obj:get_Message() end) --guarded: the native getter can throw
-					old_txt = ok_txt and old_txt or ""
-					panel:set_Visible(true)
-					txt_obj:set_Visible(true)
-					if sm32.set_message(txt_obj, txt) then --only recolour the label if the text could be written
-						local old_col = txt_obj:get_Color()
-						local o_r, o_g, o_b = sm32.color_get(old_col)
-						sm32.color_rgba(col, o_r, o_g, o_b, 255)
-						txt_obj:set_Color(col)
-						panel:set_ColorScale(Vector4f.new(1,1,1,0.5))
-						local old_cs = (casted_spells[skill_idx] or hk.gp_state.down[hk.buttons[hotkey_str] ]) and {panel:get_ColorScale(), panel:get_ColorOffset()}
-						if old_cs then
-							panel:set_ColorScale(Vector4f.new(2,2,2,2))
-							panel:set_ColorOffset(Vector3f.new(15,14,11))
-						end
-						
-						ui_fns[txt_obj] = function()
-							ui_fns[txt_obj] = nil
-							gamepad_button_guis.dpad_obj:set_DrawSelf(true)
-							gamepad_button_guis.dpad_obj:set_UpdateSelf(true)
-							
-							if gamepad_button_guis.dpad_obj:get_Update() and gamepad_button_guis.dpad_obj:get_Draw() then
-								sm32.set_message(txt_obj, old_txt) --restore the original label text
-								txt_obj:set_Color(old_col)
-								if old_cs then 
-									panel:set_ColorScale(old_cs[1])
-									panel:set_ColorOffset(old_cs[2])
-								end
-							end
-						end
-					end
-				end
-			end
-		end
-		return retval
 	end
-)
-
---This gets called like 2000 times per second so it must be efficient:
-sm32.hook("app.BattleRelationshipHolder", "getRelationshipFromTo(app.Character, app.Character)", 
-	function(args)
-		--Nothing below this hook has anything to say unless a skill or a summon is in play, and this
-		--runs thousands of times a second whether one is or not.  The answer is decided first, so a
-		--frame with nothing running does not even reach the per-thread storage.
-		if not (is_summoning or is_casting) then return end
-		local hstore = thread.get_hook_storage()
-		if sdk.to_int64(args[4]) == 0 then
-			hstore.args = nil
-			return
-		end
-		if not is_summoning and (not is_battling or not player or sdk.to_int64(args[3]) ~= player:get_address()) then
-			hstore.args = nil
-			return
-		end
-		hstore.args = args
-	end,
-	function(retval)
-		if not (is_summoning or is_casting) then return retval end
-		local hstore = thread.get_hook_storage()
-		local args = hstore.args
-		if args and (is_summoning or (is_casting and is_battling and player and sdk.to_int64(args[3]) == player:get_address())) then
-			hstore.args = nil
-			local cha1 = sdk.to_managed_object(args[3])
-			local cha2 = sdk.to_managed_object(args[4])
-			-- GSMAX: relationship callbacks can carry a stale/invalid managed character.
-			-- Do not dereference it; preserve the game's original relationship result.
-			if not cha1 or not cha2 or cha1 == cha2 then return retval end
-			if cha1 == player and sm_summons[cha2] then return sdk.to_ptr(is_battling and 2 or 0) end
-			local rels = rel_db[cha1]
-			if rels and rels[cha2] ~= nil then 
-				if not rels[cha2] then return retval end
-				return sdk.to_ptr(rels[cha2])
-			end
-			local cha2_go = nil
-			local cha2_go_ok = pcall(function() cha2_go = cha2:get_GameObject() end)
-			if not cha2_go_ok or not cha2_go then return retval end
-			if cha1 == player and not is_summoning then
-				if not rels then rel_db[cha1] = {} end
-				if is_battling and sdk.to_int64(retval) == 0 and func.getC(cha2_go, "app.NPCBehavior") then
-					rel_db[cha1][cha2] = 2
-					return sdk.to_ptr(2) --Spells wont hit neutral NPCs during combat
-				end
-				rel_db[cha1][cha2] = false
-				return retval
-			end
-			if cha1 == player then 
-				if is_battling and sdk.to_int64(retval) == 0 and func.getC(cha2_go, "app.NPCBehavior") then return sdk.to_ptr(2) end --Spells wont hit neutral NPCs during combat
-			end
-			do
-				local out
-				local summon_1 = sm_summons[cha1]
-				local summon_2 = sm_summons[cha2]
-				local em_summon_1 = em_summons[cha1]
-				local em_summon_2 = em_summons[cha2]
-				local both_tbl_1 = summon_1 or em_summon_1
-				local both_tbl_2 = summon_2 or em_summon_2
-				
-				if (em_summon_1 and cha2 == player) or (em_summon_2 and cha1 == player) then
-					out = 1
-				elseif (both_tbl_2 and both_tbl_2.owner == cha1) or (both_tbl_1 and both_tbl_1.owner == cha2) then
-					out = 2 --Summons and summoners friendly with eachother
-				elseif (em_summon_1 and em_summon_1.hostile_to_all) or (em_summon_2 and em_summon_2.hostile_to_all)  then 
-					out = 1
-				elseif both_tbl_1 and rel_db[both_tbl_1.owner] and rel_db[both_tbl_1.owner][cha2] then
-					out = rel_db[both_tbl_1.owner][cha2] --inherited hostilities from owner
-				elseif both_tbl_2 and rel_db[both_tbl_2.owner] and rel_db[both_tbl_2.owner][cha1] then
-					out = rel_db[both_tbl_2.owner][cha1]
-				--Pawns are 'ch1' CharacterIDs and carry no app.NPCBehavior, so they used to fall through
-				--to 'out = 1' and a player-side summon and the player's own pawns fought each other.
-				--If the CharacterID statics are unavailable ch_name is nil and the test is simply false.
-				elseif summon_1 then
-					local ch_name = enums.chara_id_enum[cha2:get_CharaID()]
-					local em_tbl = enemy_list[ch_name]
-					out = ((em_tbl and em_tbl.is_animal) or cha2 == player or sm_summons[cha2] or (ch_name or ""):sub(1,3) == "ch1" or func.getC(cha2_go, "app.NPCBehavior")) and 2 or 1 --friendly with animals, player, pawns, other summons and NPCs
-				elseif summon_2 then
-					local ch_name = enums.chara_id_enum[cha1:get_CharaID()]
-					local em_tbl = enemy_list[ch_name]
-					out = ((em_tbl and em_tbl.is_animal) or cha1 == player or sm_summons[cha1] or (ch_name or ""):sub(1,3) == "ch1" or func.getC(cha1:get_GameObject(), "app.NPCBehavior")) and 2 or 1
-				elseif (em_summon_1 and cha2.EnemyCtrl and cha2.EnemyCtrl._IsEnemyCharacter) or (em_summon_2 and cha1.EnemyCtrl and cha1.EnemyCtrl._IsEnemyCharacter) then
-					out = 2 --hostile summons are friendly with real enemies / eachother
-				end
-				if not rels then rel_db[cha1] = {} end
-				if out then 
-					rel_db[cha1][cha2] = out
-					retval = sdk.to_ptr(out)
-				else
-					rel_db[cha1][cha2] = false --don't re-evaluate, let the game do these
-				end
-			end
-		end
-		return retval
-	end
-)
-
-sm32.hook("app.AIBlackBoardExtensions", "setBBValuesToExecuteActInter(app.AIBlackBoardController, app.ActInterPackData, app.AITarget)", function(args)
-	if not is_summoning then return end
-	local aibb = sdk.to_managed_object(args[2])
-	if pre_fns[aibb] then return 1 end
-	local chr = aibb:get_Character()
-	local nstore = sm_summons[chr]
-	local pack = sdk.to_managed_object(args[3])
-	if nstore then
-		if nstore.following then return sdk.PreHookResult.SKIP_ORIGINAL end
-	elseif not is_battling and pack:get_Path():find("NPC_Combat[MC]") then
-		local enemy_xform = sdk.to_managed_object(args[4]):get_GameObject():get_Transform():get_Parent()
-		local enemy_chr = enemy_xform and func.getC(enemy_xform:get_GameObject(), "app.Character")
-		if sm_summons[enemy_chr] then return sdk.PreHookResult.SKIP_ORIGINAL end
-	end
-end)
-
-sm32.hook("app.Human", "isEnableFriendOrNeutralHitForPlayer", 
-	function(args)
-		local victim = sdk.to_managed_object(args[3])
-		if not is_battling and not (sm_summons[victim] and sm_summons[victim].do_no_friendlyfire) then return end
-		if (sm_summons[victim] or (func.getC(victim:get_GameObject(), "app.NPCBehavior") and rel_holder:call("getRelationshipFromTo(app.Character, app.Character)", victim, player) ~= 1)) and thread.get_hook_storage() then
-			thread.get_hook_storage().retval = sdk.to_ptr(false)
-		end
-	end,
-	function(retval)
-		return thread.get_hook_storage().retval or retval
-	end
-)
-
-sm32.hook("app.HumanDefaultCancelAction", "start", function(args)
-	pressed_cancel = (cast_prep_type > 0)
 end)
 
 sm32.hook("app.ResetCameraToLockOnTarget", "start", function(args)
@@ -9358,277 +9188,13 @@ sm32.hook("app.ResetCameraToLockOnTarget", "setCameraAngle", function(args)
 	if is_casting then return sdk.PreHookResult.SKIP_ORIGINAL end
 end)
 
-sm32.hook("app.HumanShootArrow", "start(via.behaviortree.ActionArg)", function(args)
-	if cast_prep_type == 2 and sdk.to_managed_object(args[2]).Chara == player then return sdk.PreHookResult.SKIP_ORIGINAL end
-end)
-
-sm32.hook("app.TurnController", "updateAngle", function(args)
-	if is_paused or not next(turn_fns) then return end
-	local turn_ctrl = sdk.to_managed_object(args[2])
-	if turn_fns[turn_ctrl] then
-		turn_fns[turn_ctrl]()
-	end
-end)
-
-sm32.hook("app.Shell", "checkFinish", 
-	function(args)
-		if not next(active_shells) then return end
-		local shell = sdk.to_managed_object(args[2])
-		local nstore = active_shells[shell]
-		local timer = nstore and nstore.shell.do_abs_lifetime and not shell["<TerrainHitResult>k__BackingField"] and not nstore.children[1] and shell["<LiveTimer>k__BackingField"]
-		if timer and timer._FinishFrame ~= math.huge and timer._ElapsedFrame < timer._FinishFrame then 
-			thread.get_hook_storage().retval = sdk.to_ptr(false)
-		end
-	end,
-	function(retval)
-		if not next(active_shells) then return retval end
-		return thread.get_hook_storage().retval or retval
-	end
-)
-
-sm32.hook("app.WorkRate", "setHitStop(System.Single, System.Single, System.Boolean)", function(args)
-	if temp_fns.player_speed_fn and player and sdk.to_managed_object(args[2]) == sm32.workrate(player) then
-		return sdk.PreHookResult.SKIP_ORIGINAL
-	end
-end)
-
-sm32.hook("app.TargetController", "setTarget",
-	function(args)
-		if temp.targ_hooked then return 1 end  --this method seems to call itself
-		local nstore = is_summoning and sm_summons[sdk.to_managed_object(args[2])._Chara]
-		if nstore then
-			args[3] = sdk.to_ptr(nstore.target_type or 9)
-			temp.targ_hooked, nstore.target_type = true, false
-		end
-	end, 
-	function(retval)
-		temp.targ_hooked = false
-		return retval
-	end,
-	true
-)
-
-local function em_activate_fn_checker(sp_tbl, em_chr, em_act, em_tbl, redir_name, final_name, skill_idx, actname1, skill_storage)
-	if sp_tbl.activate_fn == "" then return true end
-	local fn_env = {
-		ActName=actname1 or em_act.Fsm:getCurrentNodeName(0):match(".+%.(.+)"), 
-		SkillData=sp_tbl, 
-		Skill=skill_storage, 
-		Owner=em_chr, 
-		Player=player,
-		Exec = function(skill_name) 
-			local skill_idx2 = func.find_key(sms.enemyskills[final_name].skills, skill_name, "name")
-			if skill_idx2 then 
-				enemy_casts[em_act] = {sp_tbl=sms.enemyskills[final_name].skills[skill_idx2], em_chr=em_chr, act_mgr=em_act, name=em_tbl.name, idx=skill_idx2, redir_name=redir_name}
-				enemy_casts[em_act].key = em_chr:get_address()..skill_name
-			end
-		end,
-		Stop = function()
-			skill_storage.killed = true
-		end,
-		Kill = function(skill_name) 
-			if active_skills[skill_name] then casted_spells[active_skills[skill_name].idx] = nil end
-		end,
-	}
-	fn_env.ActName2 = em_act.Fsm:getCurrentNodeName(1)
-	fn_env.ActName2 = fn_env.ActName2 and fn_env.ActName2:match(".+%.(.+)")
-	
-	local t_ctrl = em_chr.EnemyCtrl.Ch2 and em_chr.EnemyCtrl.Ch2._TargetController
-	fn_env.Target = t_ctrl and t_ctrl._AITarget or t_ctrl:getTarget(t_ctrl._TargetType)
-	local try, output = pcall(load(sp_tbl.activate_fn, nil, "t", hk.merge_tables(_G, fn_env)))
-	sm32.fn_env_clear(fn_env)
-	local imgui_em_skill = imgui_em_skills[final_name][skill_idx]
-	if imgui_em_skill then 
-		imgui_em_skill.error_txt = not try and {output, os.clock()} or imgui_em_skill.error_txt 
-		imgui_em_skill.last_data = {target=fn_env.Target, owner=em_chr, skill=sp_tbl}
-	end
-	return try and output
-end
-
---Enemy Skills are evaluated and launched here
-sm32.hook("app.ActionManager", "requestActionCore(app.ActionManager.Priority, System.String, System.UInt32)", function(args)
-	if sm32.has_any_enemy_skill and player and not is_paused and not next(enemy_casts) then
-		local em_act = sdk.to_managed_object(args[2])
-		if not em_act then return end
-		local ok_go, gameobj = pcall(em_act.get_GameObject, em_act)
-		if not ok_go or not gameobj then return end
-		local em_chr = func.getC(gameobj, "app.Character")
-		if not em_chr then return end
-		local em_ch_name = enums.chara_id_enum[em_chr:get_CharaID()] or ""
-		local em_tbl = enemy_list[em_ch_name] or enemy_list[em_ch_name:sub(1,3)]
-		if not em_tbl or em_tbl.is_animal then return end
-		local em_skills_data_og = em_tbl and sms.enemyskills[em_tbl.name]
-		if not em_skills_data_og or not em_skills_data_og.enabled then return end
-		local redir_name = em_skills_data_og.redirect_idx > 1 and redirect_names[em_skills_data_og.redirect_idx]
-		local em_skills_data = sms.enemyskills[redir_name] or em_skills_data_og
-		
-		if em_skills_data then
-			local human = em_chr:get_Human() 
-			local em_node_name = sdk.to_managed_object(args[4]):ToString() or ""
-			local is_pawn = human and func.getC(gameobj, "app.SpecialPawn")
-			local player_level = player:get_Human():get_StatusContext()._Level
-			local final_name = redir_name or em_tbl.name
-			
-			local function found_keyword(to_search, keywords)
-				for i, keyword in ipairs(split(keywords, ",", true)) do if to_search:find(keyword) then return true end end
-			end
-			
-			for i, sp_tbl in ipairs(em_skills_data.skills) do
-				local sp_act_name = sp_tbl.act_name ~= "" and sp_tbl.act_name
-				local key = em_chr:get_address()..(sp_tbl.name~="" and sp_tbl.name or i)
-				sp_tbl.min_player_lvl = sp_tbl.min_player_lvl or 0 --FIXME
-				
-				if sp_tbl.enabled and sp_tbl.min_player_lvl <= player_level then
-					if sp_tbl.do_replace_enemy and sm_summons[em_chr] == nil then
-						local em_xform = em_chr:get_Transform()
-						local em_pos = em_xform:get_Position()
-						local dist = (pl_xform:get_Position() - em_pos):length()
-						if (not replaced_enemies[em_chr] or not replaced_enemies[em_chr].replaced) and dist > 10.0 and dist < 90.0 then
-							replaced_enemies[em_chr] = replaced_enemies[em_chr] or {spawn_time = game_time}
-							if not replaced_enemies[em_chr][sp_tbl.name] and game_time - replaced_enemies[em_chr].spawn_time > 2.0 and not is_visible(em_chr:get_Transform()) then
-								local try, location_ready = pcall(function()
-									if sp_tbl.locations == "" then return true end
-									local locs = {}
-									for i, loc_number in ipairs(split(sp_tbl.locations, ",", true)) do
-										if tostring(wgraph_mgr:call("findNearNodeID(via.Position, System.Int32)", em_xform:get_UniversalPosition(), 0).blockId):find(loc_number) then
-											return true
-										end
-									end
-								end)
-								if try and location_ready and 1000 * sp_tbl.odds_to_replace >= math.random(0, 1000) then
-									local skill_storage = {}
-									if em_activate_fn_checker(sp_tbl, em_chr, em_act, em_tbl, redir_name, final_name, i, nil, skill_storage) then
-										replaced_enemies[em_chr].replaced = true
-										print("Replacing enemy", em_tbl.name, "using spell", sp_tbl.name, draw.world_to_screen(em_pos), dist)
-										log.info("Replacing enemy "..em_tbl.name.." using spell "..sp_tbl.name.." at distance "..dist)
-										enemy_casts[em_act] = {sp_tbl=sp_tbl, em_chr=em_chr, act_mgr=em_act, name=em_tbl.name, key=key, idx=i, redir_name=redir_name, storage=skill_storage}
-										return nil
-									end
-								end
-								replaced_enemies[em_chr][sp_tbl.name] = true --only try once
-							end
-						end
-					else
-						local is_req_skill_ready = (sp_tbl.summon_skill_name == "") or (summon_record[em_chr] and summon_record[em_chr].parent.skill.name == sp_tbl.summon_skill_name)
-						if is_req_skill_ready and not casted_spells[key] and not temp_fns[key] and ((sp_tbl.search_txt ~= "" and found_keyword(em_node_name, sp_tbl.search_txt)) or (sp_tbl.replace_idx > 1 and sp_act_name == em_node_name)) then
-							local layer_idx = sp_tbl.do_upperbody and 1 or 0
-							local is_job_ready = not human or sp_tbl.em_job_idx == 1 or human.HumanEnemyController.JobContext.CurrentJob == sp_tbl.em_job_idx-1
-							local are_odds_ready = sp_tbl.odds_to_replace >= 1 or sp_tbl.activate_interval ~= -1 or 1000 * sp_tbl.odds_to_replace >= math.random(0, 1000)
-							
-							if is_job_ready and are_odds_ready then
-								print("Detected enemy skill candidate:", em_tbl.name, "Action name:", em_node_name, "Key:", key)
-								log.info("Detected enemy skill candidate: " .. em_tbl.name .. "	" .. em_node_name .. "	" .. sp_tbl.act_name .. "	" .. sp_tbl.name .. "	" .. layer_idx)
-								local sp_anim_txt = sp_tbl.anim_search_txt ~= "" and sp_tbl.anim_search_txt
-								local hit = em_chr:get_Hit()
-								local delay_time = sp_tbl.delay_time
-								local skill_storage = {}
-								local start, ticks_start = game_time, ticks
-								
-								if (em_tbl.is_human or em_tbl.name:sub(1,4)=="Skel") and sm_summons[em_chr] == nil then 
-									for s, smnode in ipairs(sp_tbl.smnodes) do
-										if smnode.action_idx > 1 and sm32.node_layer(em_act.Fsm, smnode.action_name) == nil and sm32.node_layer(mfsm2, smnode.action_name) ~= nil then 
-											enable_pl_fsm_on_em(em_chr) --add missing actions to skeletons and bandits if needed
-											break
-										end
-									end
-								end
-								
-								--this function watches every frame while the action is playing and runs the skill if the conditions are met:
-								temp_fns[key] = function() 
-									
-									if not em_act.Fsm or ticks - ticks_start < 3 then return end --has to load a bunch of shit for the new action first
-									local nname = em_act.Fsm:getCurrentNodeName(layer_idx); nname = nname:match(".+%.(.+)") or nname
-									local past_delay = game_time - start >= delay_time
-									if not em_chr:get_Valid() or (past_delay and nname ~= em_node_name and (sp_tbl.search_txt == "" or not found_keyword(nname, sp_tbl.search_txt))) then 
-										temp_fns[key] = nil 
-									end
-									
-									if temp_fns[key] then 
-										local mnode = sp_anim_txt and em_chr:get_Motion():getLayer(layer_idx):get_HighestWeightMotionNode()
-										local hitbox_ready = not sp_tbl.require_hitbox
-										if not hitbox_ready then
-											dmg_tbl[hit] = dmg_tbl[hit] or {last_hit=0}
-											local req_tracks = get_req_tracks(em_chr)
-											hitbox_ready = req_tracks and (req_tracks.ReqId1 >= 0 or req_tracks.ReqId2 >= 0 or req_tracks.ReqId3 >= 0 or req_tracks.ReqId4 >= 0 or req_tracks.ReqId5 >= 0 
-												or req_tracks.ReqId6 >= 0 or req_tracks.ReqId7 >= 0 or req_tracks.ReqId8 >= 0 or req_tracks.ReqId9 >= 0)
-											if sp_tbl.require_hitbox_contact then 
-												hitbox_ready = game_time - dmg_tbl[hit].last_hit < 0.05
-											end
-										end
-										
-										local interval_ready = (sp_tbl.activate_interval == -1)
-										if not interval_ready and game_time - start > sp_tbl.activate_interval and past_delay then 
-											interval_ready = (1000 * sp_tbl.odds_to_replace >= math.random(0, 1000)) and 1
-											delay_time = 0
-											start = game_time
-										end
-										
-										if past_delay and hitbox_ready and interval_ready and (not mnode or mnode:get_MotionName():find(sp_anim_txt)) then 
-											temp_fns[key] = (interval_ready == 1) and temp_fns[key] or nil
-											if (interval_ready == 1) then start = start + sp_tbl.activate_interval end --reset interval
-											
-											local activate_fn_ready = em_activate_fn_checker(sp_tbl, em_chr, em_act, em_tbl, redir_name, final_name, i, nname, skill_storage)
-											if skill_storage.killed then  temp_fns[key] = nil end
-											if activate_fn_ready then
-												enemy_casts[em_act] = {sp_tbl=sp_tbl, em_chr=em_chr, act_mgr=em_act, name=em_tbl.name, key=key, idx=i, redir_name=redir_name, storage=skill_storage}
-											end
-										end
-									end
-								end
-								temp_fns[key]()
-								
-								if sp_tbl.activate_interval == -1 then
-									return nil --activate only one skill per enemy per frame, unless it uses an interval
-								end
-							end
-						end
-					end
-				end
-			end
-		end
-	end
-end)
-
-sm32.hook("app.CharacterManager", "getCharacterExp(app.Character)", 
-	function(args)
-		local chr =  sdk.to_managed_object(args[3])
-		if temp.skip_exp_gain or sm_summons[chr] then 
-			temp.skip_exp_gain = nil
-			thread.get_hook_storage().ret = sdk.to_ptr(0) 
-		end
-	end,
-	function(retval)
-		return thread.get_hook_storage().ret or retval
-	end
-)
-
-sm32.hook("app.Ch255BattleWayPointCtrl", "nodeFindBattlePosition", nil, function(retval)
-	if ticks % 120 == 0 or temp.summoned_medusa then 
-		temp.summoned_medusa = nil
-		return sdk.to_ptr(true) 
-	end
-	return retval
-end)
-
-sm32.hook("app.Ch227", "update", function(args)
-	if is_battling and sm_summons[sdk.to_managed_object(args[2])._Chara] then 
-		return sdk.PreHookResult.SKIP_ORIGINAL
-	end
-end)
-
-sm32.hook("app.actinter.Executor", "forceEndAction", function(args)
-	local chr = is_summoning and sdk.to_managed_object(args[2])._ActInter:get_Character()
-	if chr and pre_fns[chr:get_AIBlackBoardController()] then 
-		return sdk.PreHookResult.SKIP_ORIGINAL
-	end
-end, nil, true)
-
 --Hitbox and damage-type related stuff is evaluated here
+local has_dmg_override = false
 sm32.hook("app.HitController", "getReactionDamageType(app.HitController.DamageInfo)", 
 	function(args)
 		local hit_info = sdk.to_managed_object(args[3])
 		local hit = hit_info:get_AttackHitController()
-		if player and hit == player["<Hit>k__BackingField"] then temp.last_pl_hit_landed = game_time end
+		if sm32.pl_hit and hit == sm32.pl_hit then temp.last_pl_hit_landed = game_time end
 		local nstore = dmg_tbl[hit]
 		
 		if nstore then 
@@ -9680,78 +9246,622 @@ sm32.hook("app.HitController", "getReactionDamageType(app.HitController.DamageIn
 			elseif (node_json.dmg_type_owner > 1 or node_json.dmg_type_shell > 1) then
 				local dmg_type = is_shell and node_json.dmg_type_shell-3 or node_json.dmg_type_owner-3
 				hit_info.DamageType, hit_info.DamageActType, hit_info.OverwriteBlownType = dmg_type, dmg_type, dmg_type
-				thread.get_hook_storage().retval = dmg_type
+				has_dmg_override = true
+				thread.get_hook_storage().retval = sdk.to_ptr(dmg_type)
 			end
 		end
 	end,
 	function(retval)
-		return thread.get_hook_storage().retval or retval
-	end
-)
-
-sm32.hook("app.CorpseController", "setCorpseStep", function(args)
-	if not is_summoning then return end
-	local chr = sdk.to_managed_object(args[2]):get_Chara()
-	local nstore = sm_summons[chr] or em_summons[chr]
-	if nstore and nstore.corpse_lvl then
-		args[3] = sdk.to_ptr(nstore.corpse_lvl)
-	end
-end)
-
-sm32.hook("app.Ch253001SubdueCtrl", "onAtkCalcDamageEnd", function(args)
-	if sm_summons[sdk.to_managed_object(args[2]).Ch253001._Chara] ~= nil then 
-		return sdk.PreHookResult.SKIP_ORIGINAL --lets summoned sphinxes die
-	end
-end)
-
-sm32.hook("app.Shell", "requestOmenEffect", 
-	function(args)
-		if not next(temp.omen_reqs) then return end
-		local shell = sdk.to_managed_object(args[2])
-		local nstore = temp.omen_reqs[shell]
-		if nstore then
-			local hstore = thread.get_hook_storage()
-			hstore.shell = shell
-			hstore.nstore = nstore
-		end
-	end,
-	function(retval)
-		if not next(temp.omen_reqs) then return retval end
-		local hstore = thread.get_hook_storage() 
-		if hstore.nstore then
-			local nstore = hstore.nstore
-			hstore.nstore = nil
-			temp.omen_reqs[hstore.shell] = nil
-			--this runs inside the engine's own call frame, so nothing here may raise: a missing effect
-			--manager would otherwise index the update-function table with nil
-			local omen_efx2 = hstore.shell["<EffectManager2>k__BackingField"]
-			if omen_efx2 then
-				local ok_omen, omen_err = pcall(change_efx2_color, omen_efx2, nstore, nil, hstore.shell)
-				if not ok_omen and sm32.dbg_on then sm32.dbg("shell", "the omen effect colour pass raised: "..tostring(omen_err)) end
-			end
+		if not has_dmg_override then return retval end
+		local hstore = thread.get_hook_storage()
+		local r = hstore.retval
+		if r ~= nil then
+			hstore.retval = nil
+			has_dmg_override = false
+			return r
 		end
 		return retval
 	end
 )
 
-sm32.hook("app.Ch229", "tryGetWarpPosition", function(args)
-	local chara = sdk.to_managed_object(args[2])._Chara
-	local nstore = sm_summons[chara]
-	if nstore and nstore.command_coords then 
-		local coords = nstore.command_coords
-		local pos = sdk.to_valuetype(args[3], "via.vec3")
-		pos.x, pos.y, pos.z = coords.x, coords.y, coords.z
-		args[3] = sdk.to_ptr(pos:get_address())
-		local pos2 = sdk.to_valuetype(args[5], "via.vec3")
-		local pl_pos = pl_xform:get_Position()
-		pos2.x, pos2.y, pos2.z = coords.x + (pl_pos.x - pos2.x), coords.y + (pl_pos.y - pos2.y), coords.z + (pl_pos.z - pos2.z)
-		args[5] = sdk.to_ptr(pos2:get_address())
-	end
-end)
-
 sm32.hook("app.FilterParamRadialBlur", "copyTo", function(args)
 	if is_casting then return sdk.PreHookResult.SKIP_ORIGINAL end --this shit is not even noticeable, blur is always lame and all it does is make colored shells turn into this nasty opaque blob on your screen
 end)
+
+local function em_activate_fn_checker(sp_tbl, em_chr, em_act, em_tbl, redir_name, final_name, skill_idx, actname1, skill_storage)
+	if sp_tbl.activate_fn == "" then return true end
+	local fn_env = {
+		ActName=actname1 or em_act.Fsm:getCurrentNodeName(0):match(".+%.(.+)"), 
+		SkillData=sp_tbl, 
+		Skill=skill_storage, 
+		Owner=em_chr, 
+		Player=player,
+		Exec = function(skill_name) 
+			local skill_idx2 = func.find_key(sms.enemyskills[final_name].skills, skill_name, "name")
+			if skill_idx2 then 
+				enemy_casts[em_act] = {sp_tbl=sms.enemyskills[final_name].skills[skill_idx2], em_chr=em_chr, act_mgr=em_act, name=em_tbl.name, idx=skill_idx2, redir_name=redir_name}
+				enemy_casts[em_act].key = em_chr:get_address()..skill_name
+			end
+		end,
+		Stop = function()
+			skill_storage.killed = true
+		end,
+		Kill = function(skill_name) 
+			if active_skills[skill_name] then casted_spells[active_skills[skill_name].idx] = nil end
+		end,
+	}
+	fn_env.ActName2 = em_act.Fsm:getCurrentNodeName(1)
+	fn_env.ActName2 = fn_env.ActName2 and fn_env.ActName2:match(".+%.(.+)")
+	
+	local t_ctrl = em_chr.EnemyCtrl.Ch2 and em_chr.EnemyCtrl.Ch2._TargetController
+	fn_env.Target = t_ctrl and t_ctrl._AITarget or t_ctrl:getTarget(t_ctrl._TargetType)
+	local try, output = pcall(load(sp_tbl.activate_fn, nil, "t", hk.merge_tables(_G, fn_env)))
+	sm32.fn_env_clear(fn_env)
+	local imgui_em_skill = imgui_em_skills[final_name][skill_idx]
+	if imgui_em_skill then 
+		imgui_em_skill.error_txt = not try and {output, os.clock()} or imgui_em_skill.error_txt 
+		imgui_em_skill.last_data = {target=fn_env.Target, owner=em_chr, skill=sp_tbl}
+	end
+	return try and output
+end
+
+sm32.hooked_features = sm32.hooked_features or {}
+
+function sm32.ensure_feature_hooks()
+	local hf = sm32.hooked_features
+
+	if sms.ingame_ui_buttons and sms.modifier_inhibits_buttons and not hf.ui_buttons then
+		hf.ui_buttons = true
+		sm32.hook("app.ui020401", "update", 
+			function(args)
+				for name, fn in pairs(ui_fns) do
+					fn()
+				end
+			end,
+			function(retval)
+				if sms.ingame_ui_buttons and sms.modifier_inhibits_buttons and gamepad_button_guis and is_modifier_down and gamepad_button_guis.face_obj:get_DrawSelf() then
+					gamepad_button_guis.dpad_obj:set_DrawSelf(true)
+					gamepad_button_guis.dpad_obj:set_UpdateSelf(true)
+
+					local hotkey_arr = hk.buttons[sms.hotkeys["Modifier / Inhibit"] ] and gamepad_button_guis.dpad_arr or gamepad_button_guis.dpad_arr_kb
+					for j, hotkey_str in ipairs(gamepad_button_guis.dpad_arr) do
+						local hotkey = hotkey_arr[j]
+						local cfg_idx = sksets_by_hotkeys[hotkey]
+						local skill_idx = (is_modifier2_down and ((is_modifier_down and skills_by_hotkeys2[hotkey]) or (is_sws_down and skills_by_hotkeys_sws[hotkey]) or (not is_sws_down and skills_by_hotkeys_no_sws[hotkey]))) 
+							or (is_modifier_down and (((is_sws_down and skills_by_hotkeys_sws[hotkey]) or (not is_sws_down and skills_by_hotkeys_no_sws[hotkey])) or ((skills_by_hotkeys[hotkey] and not sms.skills[skills_by_hotkeys[hotkey] ].use_modifier2) and skills_by_hotkeys[hotkey])))
+							or (is_sws_down and skills_by_hotkeys_sws[hotkey]) or (not is_sws_down and skills_by_hotkeys_no_sws[hotkey])
+						local txt_obj = gamepad_button_guis[hotkey_str]
+						local txt
+						
+						if cfg_idx and sms.skillsets.idxes[cfg_idx] > 1 and (not sms.load_sksets_w_modifier or is_modifier_down) and (not sms.load_sksets_w_sksets_modifier or is_cfg_modifier_down) then
+							txt = skillsets_glob.short[sms.skillsets.idxes[cfg_idx] ]
+							txt = "["..(txt:match(".+ %- (.+)") or txt:match(".+%\\(.+)") or txt):gsub("_", " ").."]"
+						elseif (skill_idx and ((is_modifier_down and skills_by_hotkeys[hotkey]) or (is_sws_down and skills_by_hotkeys_sws[hotkey]) or (not is_sws_down and skills_by_hotkeys_no_sws[hotkey]))) or (not skill_idx and sms.modifier_inhibits_buttons and is_modifier_down and ((hk.buttons[hotkey_str] or 0) & (sm32.dpad_used_bits or -1)) ~= 0) then
+							txt = not skill_idx and " " or sms.last_sel_spells[skill_idx] ~= "" and sms.last_sel_spells[skill_idx] or "Skill "..skill_idx
+							txt = (txt:match(".+ %- (.+)") or txt:match(".+%\\(.+)") or txt):gsub("_", " ")
+						end
+						
+						if txt then
+							local panel = txt_obj:get_Parent()
+							local ok_txt, old_txt = pcall(function() return txt_obj:get_Message() end)
+							old_txt = ok_txt and old_txt or ""
+							panel:set_Visible(true)
+							txt_obj:set_Visible(true)
+							if sm32.set_message(txt_obj, txt) then
+								local old_col = txt_obj:get_Color()
+								local o_r, o_g, o_b = sm32.color_get(old_col)
+								sm32.color_rgba(col, o_r, o_g, o_b, 255)
+								txt_obj:set_Color(col)
+								panel:set_ColorScale(Vector4f.new(1,1,1,0.5))
+								local old_cs = (casted_spells[skill_idx] or hk.gp_state.down[hk.buttons[hotkey_str] ]) and {panel:get_ColorScale(), panel:get_ColorOffset()}
+								if old_cs then
+									panel:set_ColorScale(Vector4f.new(2,2,2,2))
+									panel:set_ColorOffset(Vector3f.new(15,14,11))
+								end
+								
+								ui_fns[txt_obj] = function()
+									ui_fns[txt_obj] = nil
+									gamepad_button_guis.dpad_obj:set_DrawSelf(true)
+									gamepad_button_guis.dpad_obj:set_UpdateSelf(true)
+									
+									if gamepad_button_guis.dpad_obj:get_Update() and gamepad_button_guis.dpad_obj:get_Draw() then
+										sm32.set_message(txt_obj, old_txt)
+										txt_obj:set_Color(old_col)
+										if old_cs then 
+											panel:set_ColorScale(old_cs[1])
+											panel:set_ColorOffset(old_cs[2])
+										end
+									end
+								end
+							end
+						end
+					end
+				end
+				return retval
+			end
+		)
+	end
+
+	if sm32.has_any_prep_skill and not hf.prep_skill then
+		hf.prep_skill = true
+		sm32.hook("app.HumanDefaultCancelAction", "start", function(args)
+			pressed_cancel = (cast_prep_type > 0)
+		end)
+		sm32.hook("app.HumanShootArrow", "start(via.behaviortree.ActionArg)", function(args)
+			if cast_prep_type == 2 and sdk.to_managed_object(args[2]).Chara == player then return sdk.PreHookResult.SKIP_ORIGINAL end
+		end)
+	end
+
+	if sm32.has_any_abs_lifetime_shell and not hf.abs_lifetime then
+		hf.abs_lifetime = true
+		sm32.hook("app.Shell", "checkFinish", 
+			function(args)
+				if not next(active_shells) then return end
+				local shell = sdk.to_managed_object(args[2])
+				local nstore = active_shells[shell]
+				local timer = nstore and nstore.shell.do_abs_lifetime and not shell["<TerrainHitResult>k__BackingField"] and not nstore.children[1] and shell["<LiveTimer>k__BackingField"]
+				if timer and timer._FinishFrame ~= math.huge and timer._ElapsedFrame < timer._FinishFrame then 
+					thread.get_hook_storage().retval = sdk.to_ptr(false)
+				end
+			end,
+			function(retval)
+				if not next(active_shells) then return retval end
+				return thread.get_hook_storage().retval or retval
+			end
+		)
+	end
+
+	if sm32.has_any_player_speed and not hf.player_speed then
+		hf.player_speed = true
+		sm32.hook("app.WorkRate", "setHitStop(System.Single, System.Single, System.Boolean)", function(args)
+			if temp_fns.player_speed_fn and player and sdk.to_managed_object(args[2]) == sm32.workrate(player) then
+				return sdk.PreHookResult.SKIP_ORIGINAL
+			end
+		end)
+	end
+
+	if sm32.has_any_omen_shell and not hf.omen_shell then
+		hf.omen_shell = true
+		sm32.hook("app.Shell", "requestOmenEffect", 
+			function(args)
+				if not next(temp.omen_reqs) then return end
+				local shell = sdk.to_managed_object(args[2])
+				local nstore = temp.omen_reqs[shell]
+				if nstore then
+					local hstore = thread.get_hook_storage()
+					hstore.shell = shell
+					hstore.nstore = nstore
+				end
+			end,
+			function(retval)
+				if not next(temp.omen_reqs) then return retval end
+				local hstore = thread.get_hook_storage() 
+				if hstore.nstore then
+					local nstore = hstore.nstore
+					hstore.nstore = nil
+					temp.omen_reqs[hstore.shell] = nil
+					local omen_efx2 = hstore.shell["<EffectManager2>k__BackingField"]
+					if omen_efx2 then
+						local ok_omen, omen_err = pcall(change_efx2_color, omen_efx2, nstore, nil, hstore.shell)
+						if not ok_omen and sm32.dbg_on then sm32.dbg("shell", "the omen effect colour pass raised: "..tostring(omen_err)) end
+					end
+				end
+				return retval
+			end
+		)
+	end
+
+	if sm32.has_any_enemy_skill and not hf.enemy_skill then
+		hf.enemy_skill = true
+		sm32.hook("app.ActionManager", "requestActionCore(app.ActionManager.Priority, System.String, System.UInt32)", function(args)
+			if sm32.has_any_enemy_skill and player and not is_paused and not next(enemy_casts) then
+				local em_act = sdk.to_managed_object(args[2])
+				if not em_act then return end
+				local ok_go, gameobj = pcall(em_act.get_GameObject, em_act)
+				if not ok_go or not gameobj then return end
+				local em_chr = func.getC(gameobj, "app.Character")
+				if not em_chr then return end
+				local em_ch_name = enums.chara_id_enum[em_chr:get_CharaID()] or ""
+				local em_tbl = enemy_list[em_ch_name] or enemy_list[em_ch_name:sub(1,3)]
+				if not em_tbl or em_tbl.is_animal then return end
+				local em_skills_data_og = em_tbl and sms.enemyskills[em_tbl.name]
+				if not em_skills_data_og or not em_skills_data_og.enabled then return end
+				local redir_name = em_skills_data_og.redirect_idx > 1 and redirect_names[em_skills_data_og.redirect_idx]
+				local em_skills_data = sms.enemyskills[redir_name] or em_skills_data_og
+				
+				if em_skills_data then
+					local human = em_chr:get_Human() 
+					local em_node_name = sdk.to_managed_object(args[4]):ToString() or ""
+					local is_pawn = human and func.getC(gameobj, "app.SpecialPawn")
+					local player_level = player:get_Human():get_StatusContext()._Level
+					local final_name = redir_name or em_tbl.name
+					
+					local function found_keyword(to_search, keywords)
+						for i, keyword in ipairs(split(keywords, ",", true)) do if to_search:find(keyword) then return true end end
+					end
+					
+					for i, sp_tbl in ipairs(em_skills_data.skills) do
+						local sp_act_name = sp_tbl.act_name ~= "" and sp_tbl.act_name
+						local key = em_chr:get_address()..(sp_tbl.name~="" and sp_tbl.name or i)
+						sp_tbl.min_player_lvl = sp_tbl.min_player_lvl or 0
+						
+						if sp_tbl.enabled and sp_tbl.min_player_lvl <= player_level then
+							if sp_tbl.do_replace_enemy and sm_summons[em_chr] == nil then
+								local em_xform = em_chr:get_Transform()
+								local em_pos = em_xform:get_Position()
+								local dist = (pl_xform:get_Position() - em_pos):length()
+								if (not replaced_enemies[em_chr] or not replaced_enemies[em_chr].replaced) and dist > 10.0 and dist < 90.0 then
+									replaced_enemies[em_chr] = replaced_enemies[em_chr] or {spawn_time = game_time}
+									if not replaced_enemies[em_chr][sp_tbl.name] and game_time - replaced_enemies[em_chr].spawn_time > 2.0 and not is_visible(em_chr:get_Transform()) then
+										local try, location_ready = pcall(function()
+											if sp_tbl.locations == "" then return true end
+											for i, loc_number in ipairs(split(sp_tbl.locations, ",", true)) do
+												if tostring(wgraph_mgr:call("findNearNodeID(via.Position, System.Int32)", em_xform:get_UniversalPosition(), 0).blockId):find(loc_number) then
+													return true
+												end
+											end
+										end)
+										if try and location_ready and 1000 * sp_tbl.odds_to_replace >= math.random(0, 1000) then
+											local skill_storage = {}
+											if em_activate_fn_checker(sp_tbl, em_chr, em_act, em_tbl, redir_name, final_name, i, nil, skill_storage) then
+												replaced_enemies[em_chr].replaced = true
+												print("Replacing enemy", em_tbl.name, "using spell", sp_tbl.name, draw.world_to_screen(em_pos), dist)
+												log.info("Replacing enemy "..em_tbl.name.." using spell "..sp_tbl.name.." at distance "..dist)
+												enemy_casts[em_act] = {sp_tbl=sp_tbl, em_chr=em_chr, act_mgr=em_act, name=em_tbl.name, key=key, idx=i, redir_name=redir_name, storage=skill_storage}
+												return nil
+											end
+										end
+										replaced_enemies[em_chr][sp_tbl.name] = true
+									end
+								end
+							else
+								local is_req_skill_ready = (sp_tbl.summon_skill_name == "") or (summon_record[em_chr] and summon_record[em_chr].parent.skill.name == sp_tbl.summon_skill_name)
+								if is_req_skill_ready and not casted_spells[key] and not temp_fns[key] and ((sp_tbl.search_txt ~= "" and found_keyword(em_node_name, sp_tbl.search_txt)) or (sp_tbl.replace_idx > 1 and sp_act_name == em_node_name)) then
+									local layer_idx = sp_tbl.do_upperbody and 1 or 0
+									local is_job_ready = not human or sp_tbl.em_job_idx == 1 or human.HumanEnemyController.JobContext.CurrentJob == sp_tbl.em_job_idx-1
+									local are_odds_ready = sp_tbl.odds_to_replace >= 1 or sp_tbl.activate_interval ~= -1 or 1000 * sp_tbl.odds_to_replace >= math.random(0, 1000)
+									
+									if is_job_ready and are_odds_ready then
+										print("Detected enemy skill candidate:", em_tbl.name, "Action name:", em_node_name, "Key:", key)
+										log.info("Detected enemy skill candidate: " .. em_tbl.name .. "	" .. em_node_name .. "	" .. sp_tbl.act_name .. "	" .. sp_tbl.name .. "	" .. layer_idx)
+										local sp_anim_txt = sp_tbl.anim_search_txt ~= "" and sp_tbl.anim_search_txt
+										local hit = em_chr:get_Hit()
+										local delay_time = sp_tbl.delay_time
+										local skill_storage = {}
+										local start, ticks_start = game_time, ticks
+										
+										if (em_tbl.is_human or em_tbl.name:sub(1,4)=="Skel") and sm_summons[em_chr] == nil then 
+											for s, smnode in ipairs(sp_tbl.smnodes) do
+												if smnode.action_idx > 1 and sm32.node_layer(em_act.Fsm, smnode.action_name) == nil and sm32.node_layer(mfsm2, smnode.action_name) ~= nil then 
+													enable_pl_fsm_on_em(em_chr)
+													break
+												end
+											end
+										end
+										
+										temp_fns[key] = function() 
+											if not em_act.Fsm or ticks - ticks_start < 3 then return end
+											local nname = em_act.Fsm:getCurrentNodeName(layer_idx); nname = nname:match(".+%.(.+)") or nname
+											local past_delay = game_time - start >= delay_time
+											if not em_chr:get_Valid() or (past_delay and nname ~= em_node_name and (sp_tbl.search_txt == "" or not found_keyword(nname, sp_tbl.search_txt))) then 
+												temp_fns[key] = nil 
+											end
+											
+											if temp_fns[key] then 
+												local mnode = sp_anim_txt and em_chr:get_Motion():getLayer(layer_idx):get_HighestWeightMotionNode()
+												local hitbox_ready = not sp_tbl.require_hitbox
+												if not hitbox_ready then
+													dmg_tbl[hit] = dmg_tbl[hit] or {last_hit=0}
+													local req_tracks = get_req_tracks(em_chr)
+													hitbox_ready = req_tracks and (req_tracks.ReqId1 >= 0 or req_tracks.ReqId2 >= 0 or req_tracks.ReqId3 >= 0 or req_tracks.ReqId4 >= 0 or req_tracks.ReqId5 >= 0 
+														or req_tracks.ReqId6 >= 0 or req_tracks.ReqId7 >= 0 or req_tracks.ReqId8 >= 0 or req_tracks.ReqId9 >= 0)
+													if sp_tbl.require_hitbox_contact then 
+														hitbox_ready = game_time - dmg_tbl[hit].last_hit < 0.05
+													end
+												end
+												
+												local interval_ready = (sp_tbl.activate_interval == -1)
+												if not interval_ready and game_time - start > sp_tbl.activate_interval and past_delay then 
+													interval_ready = (1000 * sp_tbl.odds_to_replace >= math.random(0, 1000)) and 1
+													delay_time = 0
+													start = game_time
+												end
+												
+												if past_delay and hitbox_ready and interval_ready and (not mnode or mnode:get_MotionName():find(sp_anim_txt)) then 
+													temp_fns[key] = (interval_ready == 1) and temp_fns[key] or nil
+													if (interval_ready == 1) then start = start + sp_tbl.activate_interval end
+													
+													local activate_fn_ready = em_activate_fn_checker(sp_tbl, em_chr, em_act, em_tbl, redir_name, final_name, i, nname, skill_storage)
+													if skill_storage.killed then  temp_fns[key] = nil end
+													if activate_fn_ready then
+														enemy_casts[em_act] = {sp_tbl=sp_tbl, em_chr=em_chr, act_mgr=em_act, name=em_tbl.name, key=key, idx=i, redir_name=redir_name, storage=skill_storage}
+													end
+												end
+											end
+										end
+										temp_fns[key]()
+										
+										if sp_tbl.activate_interval == -1 then
+											return nil
+										end
+									end
+								end
+							end
+						end
+					end
+				end
+			end
+		end)
+	end
+
+	if sm32.has_any_summon_skill and not hf.summon_skill then
+		hf.summon_skill = true
+		sm32.hook("app.BattleRelationshipHolder", "getRelationshipFromTo(app.Character, app.Character)", 
+			function(args)
+				if not is_summoning then return end
+				local hstore = thread.get_hook_storage()
+				if sdk.to_int64(args[4]) == 0 then
+					hstore.args = nil
+					return
+				end
+				if not is_summoning and (not is_battling or not player or sdk.to_int64(args[3]) ~= player:get_address()) then
+					hstore.args = nil
+					return
+				end
+				hstore.args = args
+			end,
+			function(retval)
+				if not is_summoning then return retval end
+				local hstore = thread.get_hook_storage()
+				local args = hstore.args
+				if args and (is_summoning or (is_casting and is_battling and player and sdk.to_int64(args[3]) == player:get_address())) then
+					hstore.args = nil
+					local cha1 = sdk.to_managed_object(args[3])
+					local cha2 = sdk.to_managed_object(args[4])
+					if not cha1 or not cha2 or cha1 == cha2 then return retval end
+					if cha1 == player and sm_summons[cha2] then return sdk.to_ptr(is_battling and 2 or 0) end
+					local rels = rel_db[cha1]
+					if rels and rels[cha2] ~= nil then 
+						if not rels[cha2] then return retval end
+						return sdk.to_ptr(rels[cha2])
+					end
+					local cha2_go = nil
+					local cha2_go_ok = pcall(function() cha2_go = cha2:get_GameObject() end)
+					if not cha2_go_ok or not cha2_go then return retval end
+					if cha1 == player and not is_summoning then
+						if not rels then rel_db[cha1] = {} end
+						if is_battling and sdk.to_int64(retval) == 0 and func.getC(cha2_go, "app.NPCBehavior") then
+							rel_db[cha1][cha2] = 2
+							return sdk.to_ptr(2)
+						end
+						rel_db[cha1][cha2] = false
+						return retval
+					end
+					if cha1 == player then 
+						if is_battling and sdk.to_int64(retval) == 0 and func.getC(cha2_go, "app.NPCBehavior") then return sdk.to_ptr(2) end
+					end
+					do
+						local out
+						local summon_1 = sm_summons[cha1]
+						local summon_2 = sm_summons[cha2]
+						local em_summon_1 = em_summons[cha1]
+						local em_summon_2 = em_summons[cha2]
+						local both_tbl_1 = summon_1 or em_summon_1
+						local both_tbl_2 = summon_2 or em_summon_2
+						
+						if (em_summon_1 and cha2 == player) or (em_summon_2 and cha1 == player) then
+							out = 1
+						elseif (both_tbl_2 and both_tbl_2.owner == cha1) or (both_tbl_1 and both_tbl_1.owner == cha2) then
+							out = 2
+						elseif (em_summon_1 and em_summon_1.hostile_to_all) or (em_summon_2 and em_summon_2.hostile_to_all)  then 
+							out = 1
+						elseif both_tbl_1 and rel_db[both_tbl_1.owner] and rel_db[both_tbl_1.owner][cha2] then
+							out = rel_db[both_tbl_1.owner][cha2]
+						elseif both_tbl_2 and rel_db[both_tbl_2.owner] and rel_db[both_tbl_2.owner][cha1] then
+							out = rel_db[both_tbl_2.owner][cha1]
+						elseif summon_1 then
+							local ch_name = enums.chara_id_enum[cha2:get_CharaID()]
+							local em_tbl = enemy_list[ch_name]
+							out = ((em_tbl and em_tbl.is_animal) or cha2 == player or sm_summons[cha2] or (ch_name or ""):sub(1,3) == "ch1" or func.getC(cha2_go, "app.NPCBehavior")) and 2 or 1
+						elseif summon_2 then
+							local ch_name = enums.chara_id_enum[cha1:get_CharaID()]
+							local em_tbl = enemy_list[ch_name]
+							out = ((em_tbl and em_tbl.is_animal) or cha1 == player or sm_summons[cha1] or (ch_name or ""):sub(1,3) == "ch1" or func.getC(cha1:get_GameObject(), "app.NPCBehavior")) and 2 or 1
+						elseif (em_summon_1 and cha2.EnemyCtrl and cha2.EnemyCtrl._IsEnemyCharacter) or (em_summon_2 and cha1.EnemyCtrl and cha1.EnemyCtrl._IsEnemyCharacter) then
+							out = 2
+						end
+						if not rels then rel_db[cha1] = {} end
+						if out then 
+							rel_db[cha1][cha2] = out
+							retval = sdk.to_ptr(out)
+						else
+							rel_db[cha1][cha2] = false
+						end
+					end
+				end
+				return retval
+			end
+		)
+
+		sm32.hook("app.AIBlackBoardExtensions", "setBBValuesToExecuteActInter(app.AIBlackBoardController, app.ActInterPackData, app.AITarget)", function(args)
+			if not is_summoning then return end
+			local aibb = sdk.to_managed_object(args[2])
+			if pre_fns[aibb] then return 1 end
+			local chr = aibb:get_Character()
+			local nstore = sm_summons[chr]
+			local pack = sdk.to_managed_object(args[3])
+			if nstore then
+				if nstore.following then return sdk.PreHookResult.SKIP_ORIGINAL end
+			elseif not is_battling and pack:get_Path():find("NPC_Combat[MC]") then
+				local enemy_xform = sdk.to_managed_object(args[4]):get_GameObject():get_Transform():get_Parent()
+				local enemy_chr = enemy_xform and func.getC(enemy_xform:get_GameObject(), "app.Character")
+				if sm_summons[enemy_chr] then return sdk.PreHookResult.SKIP_ORIGINAL end
+			end
+		end)
+
+		sm32.hook("app.Human", "isEnableFriendOrNeutralHitForPlayer", 
+			function(args)
+				local victim = sdk.to_managed_object(args[3])
+				if not is_battling and not (sm_summons[victim] and sm_summons[victim].do_no_friendlyfire) then return end
+				if (sm_summons[victim] or (func.getC(victim:get_GameObject(), "app.NPCBehavior") and rel_holder:call("getRelationshipFromTo(app.Character, app.Character)", victim, player) ~= 1)) and thread.get_hook_storage() then
+					thread.get_hook_storage().retval = sdk.to_ptr(false)
+				end
+			end,
+			function(retval)
+				return thread.get_hook_storage().retval or retval
+			end
+		)
+
+		sm32.hook("app.TargetController", "setTarget",
+			function(args)
+				if temp.targ_hooked then return 1 end
+				local nstore = is_summoning and sm_summons[sdk.to_managed_object(args[2])._Chara]
+				if nstore then
+					args[3] = sdk.to_ptr(nstore.target_type or 9)
+					temp.targ_hooked, nstore.target_type = true, false
+				end
+			end, 
+			function(retval)
+				temp.targ_hooked = false
+				return retval
+			end,
+			true
+		)
+
+		sm32.hook("app.CharacterManager", "getCharacterExp(app.Character)", 
+			function(args)
+				local chr =  sdk.to_managed_object(args[3])
+				if temp.skip_exp_gain or sm_summons[chr] then 
+					temp.skip_exp_gain = nil
+					thread.get_hook_storage().ret = sdk.to_ptr(0) 
+				end
+			end,
+			function(retval)
+				return thread.get_hook_storage().ret or retval
+			end
+		)
+
+		sm32.hook("app.Ch255BattleWayPointCtrl", "nodeFindBattlePosition", nil, function(retval)
+			if ticks % 120 == 0 or temp.summoned_medusa then 
+				temp.summoned_medusa = nil
+				return sdk.to_ptr(true) 
+			end
+			return retval
+		end)
+
+		sm32.hook("app.Ch227", "update", function(args)
+			if is_battling and sm_summons[sdk.to_managed_object(args[2])._Chara] then 
+				return sdk.PreHookResult.SKIP_ORIGINAL
+			end
+		end)
+
+		sm32.hook("app.actinter.Executor", "forceEndAction", function(args)
+			local chr = is_summoning and sdk.to_managed_object(args[2])._ActInter:get_Character()
+			if chr and pre_fns[chr:get_AIBlackBoardController()] then 
+				return sdk.PreHookResult.SKIP_ORIGINAL
+			end
+		end, nil, true)
+
+		sm32.hook("app.CorpseController", "setCorpseStep", function(args)
+			if not is_summoning then return end
+			local chr = sdk.to_managed_object(args[2]):get_Chara()
+			local nstore = sm_summons[chr] or em_summons[chr]
+			if nstore and nstore.corpse_lvl then
+				args[3] = sdk.to_ptr(nstore.corpse_lvl)
+			end
+		end)
+
+		sm32.hook("app.Ch253001SubdueCtrl", "onAtkCalcDamageEnd", function(args)
+			if sm_summons[sdk.to_managed_object(args[2]).Ch253001._Chara] ~= nil then 
+				return sdk.PreHookResult.SKIP_ORIGINAL
+			end
+		end)
+
+		sm32.hook("app.Ch229", "tryGetWarpPosition", function(args)
+			local chara = sdk.to_managed_object(args[2])._Chara
+			local nstore = sm_summons[chara]
+			if nstore and nstore.command_coords then 
+				local coords = nstore.command_coords
+				local pos = sdk.to_valuetype(args[3], "via.vec3")
+				pos.x, pos.y, pos.z = coords.x, coords.y, coords.z
+				args[3] = sdk.to_ptr(pos:get_address())
+				local pos2 = sdk.to_valuetype(args[5], "via.vec3")
+				local pl_pos = pl_xform:get_Position()
+				pos2.x, pos2.y, pos2.z = coords.x + (pl_pos.x - pos2.x), coords.y + (pl_pos.y - pos2.y), coords.z + (pl_pos.z - pos2.z)
+				args[5] = sdk.to_ptr(pos2:get_address())
+			end
+		end)
+	end
+end
+
+function sm32.refresh_feature_flags()
+	sm32.ray_for_activate, sm32.ray_for_node = false, false
+	sm32.has_any_enemy_skill = false
+	sm32.has_any_summon_skill = false
+	sm32.has_any_prep_skill = (sms.do_swap_lshoulders and true) or false
+	sm32.has_any_abs_lifetime_shell = false
+	sm32.has_any_omen_shell = false
+	sm32.has_any_player_speed = false
+
+	local function scan_smnodes(smnodes)
+		for s, smnode in ipairs(smnodes or {}) do
+			if smnode.enabled then
+				if type(smnode.custom_fn) == "string" and smnode.custom_fn:find("Crosshair", 1, true) then
+					sm32.ray_for_node = true
+				end
+				if (smnode.summon_idx or 1) > 1 or smnode.do_possess_enemy then
+					sm32.has_any_summon_skill = true
+				end
+				if smnode.do_hold or smnode.do_true_hold or (type(smnode.action_name) == "string" and (smnode.action_name:find("Prepare", 1, true) or smnode.action_name:find("Ready", 1, true))) then
+					sm32.has_any_prep_skill = true
+				end
+				if (smnode.udata_idx or 1) > 1 then
+					if smnode.do_abs_lifetime then
+						sm32.has_any_abs_lifetime_shell = true
+					end
+					if smnode.use_omen then
+						sm32.has_any_omen_shell = true
+					end
+				end
+				if smnode.player_speed and smnode.player_speed ~= 1.0 then
+					sm32.has_any_player_speed = true
+				end
+			end
+		end
+	end
+
+	for i, skill_tbl in ipairs(sms.skills or {}) do
+		if skill_tbl.enabled then
+			if type(skill_tbl.activate_fn) == "string" and skill_tbl.activate_fn:find("Crosshair", 1, true) then
+				sm32.ray_for_activate = true
+			end
+			if (skill_tbl.prep_type or 0) > 0 then
+				sm32.has_any_prep_skill = true
+			end
+			scan_smnodes(skill_tbl.smnodes)
+		end
+	end
+
+	for em_name, skills_list in pairs(sms.enemyskills or {}) do
+		local em_group_enabled = (type(skills_list) == "table" and skills_list.enabled)
+		if em_group_enabled then
+			for i, em_skill in pairs(skills_list.skills or {}) do
+				if type(em_skill) == "table" and em_skill.enabled then
+					sm32.has_any_enemy_skill = true
+					if em_skill.do_replace_enemy then
+						sm32.has_any_summon_skill = true
+					end
+					scan_smnodes(em_skill.smnodes)
+				end
+			end
+		end
+	end
+
+	sm32.wants_crosshair = sm32.ray_for_activate or sm32.ray_for_node
+	sm32.ensure_feature_hooks()
+end
+
+sm32.refresh_feature_flags()
 
 --one-line load summary (hook registration + which compatibility fallbacks are in use)
 sm32.summary(version)
